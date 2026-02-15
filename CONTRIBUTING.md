@@ -1,18 +1,18 @@
 # Contributing to Pike LSP
 
-Thank you for your interest in contributing to Pike LSP! This document provides guidelines and instructions for contributing.
+Thank you for your interest in contributing to Pike LSP. This document provides guidelines and instructions for contributors.
 
-> **Note:** This project was 100% coded by AI agents. Contributions are welcome, but please be aware that the original codebase was AI-generated. The maintainer(s) are not responsible for any issues arising from the use of this software. All contributions will be reviewed but contributors assume responsibility for their own code.
+> **Note:** This project is in active development. Contributions are welcome, and all submissions will be reviewed. Contributors are responsible for ensuring their code meets the project's quality standards.
 
-## 📋 Code of Conduct
+## Code of Conduct
 
 Please be respectful and constructive in all interactions. We welcome contributors of all experience levels.
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 
-1. **Pike 8.0+** - The Pike programming language
+1. **Pike 8.1116 or later** - The Pike programming language
 2. **Node.js 18+** - JavaScript runtime
 3. **pnpm** - Package manager (install with `npm install -g pnpm`)
 4. **VS Code** - For extension development and testing
@@ -21,7 +21,7 @@ Please be respectful and constructive in all interactions. We welcome contributo
 
 ```bash
 # Clone the repository
-git clone https://github.com/pike-lsp/pike-lsp.git
+git clone https://github.com/TheSmuks/pike-lsp.git
 cd pike-lsp
 
 # Install dependencies
@@ -34,7 +34,9 @@ pnpm build
 ./scripts/run-tests.sh
 ```
 
-## 📁 Project Structure
+> **Note:** For local development, Pike 8.1116 is recommended. CI automatically tests on multiple Pike versions (8.1116 as required, latest as best-effort).
+
+## Project Structure
 
 ```
 pike-lsp/
@@ -49,7 +51,7 @@ pike-lsp/
 └── test/                    # Test fixtures
 ```
 
-## 🔧 Development Workflow
+## Development Workflow
 
 ### 1. Create a Branch
 
@@ -79,6 +81,7 @@ node --test dist/tests/lsp-tests.js
 ```
 
 #### Pike Stdlib Source Paths
+
 The stdlib parsing tests look for a Pike source checkout at `../Pike` by default. Override with:
 
 ```bash
@@ -113,7 +116,7 @@ Commit message prefixes:
 4. Wait for CI to pass
 5. Request review
 
-## 🧪 Testing Guidelines
+## Testing Guidelines
 
 ### Test Structure
 
@@ -158,11 +161,72 @@ describe('Your Feature', () => {
 
 ### Test Requirements
 
-- All new features MUST have tests
-- Tests MUST pass before merging
-- Pike stdlib files MUST continue to parse (100% compatibility)
+- All new features must have tests
+- Tests must pass before merging
+- Pike stdlib files must continue to parse (100% compatibility)
 
-## 📝 Code Style
+### Version Testing
+
+- **Local development:** Use Pike 8.1116
+- **CI:** Tests on Pike 8.1116 (required) and latest (best-effort)
+- **When adding compat shims:** Test on both versions if possible
+- **Version-specific issues:** Add to Known Issues table in README.md
+
+## Pre-Merge Verification Checklist
+
+Before submitting any pull request, complete these steps.
+
+### Required (All PRs)
+
+- [ ] **Run smoke test**: `pike test/tests/smoke-test.pike`
+  - Verify all Pike files compile standalone
+  - Verify all LSP modules load successfully
+  - Verify LSP server starts without errors
+  - Verify all LSP handlers return valid JSON-RPC responses
+
+- [ ] **Run full test suite**: `./scripts/run-pike-tests.sh`
+  - All tests must pass
+  - CI must pass on Pike 8.1116 (required)
+
+- [ ] **If changing Pike scripts**: Rebundle extension
+  - Run: `pnpm build` (calls bundle-server.sh)
+  - Verify extension bundle includes updated pike-scripts
+
+### Required for LSP Feature Changes
+
+For any PR that affects LSP behavior, manual testing is required:
+
+- [ ] **Manual extension test**: `cd packages/vscode-pike && pnpm package && code --install-extension pike-language-server-*.vsix --force`
+
+Then in VS Code with a Pike test file:
+  - [ ] Open Pike file -> no crash
+  - [ ] Type `Array.` -> completion shows stdlib methods
+  - [ ] Type user-defined symbol name -> completion works
+  - [ ] Hover over symbol -> type information shown
+  - [ ] Ctrl+click symbol -> navigates to definition
+
+All checks must pass before merging.
+
+### Required for Pike Script Changes
+
+- [ ] **Standalone compilation test**: `pike -e 'write("%d", programp(compile_file("your-file.pike")));'`
+  - Must return 1 (valid program)
+
+- [ ] **Module loading test**: After adding module path, verify `master()->resolv("LSP.YourModule")` returns non-null
+
+- [ ] **Handler test**: Verify handler returns mapping with "result" field
+
+### Common Failure Patterns
+
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| compile_file() fails | Syntax error or missing import | Check Pike syntax, verify imports |
+| master()->resolv() fails | Module path not set or wrong name | Call add_module_path() first, check module name |
+| Handler returns error | Missing dependency or exception | Check handler logic, verify cache/parser available |
+| Tests pass but extension fails | Bundle not rebuilt | Run `pnpm build` to rebundle |
+| LSP features don't work | Handler logic broken | Verify handler returns correct JSON-RPC structure |
+
+## Code Style
 
 ### TypeScript
 
@@ -186,6 +250,8 @@ async function parse(code: string, filename?: string): Promise<PikeParseResult>
 - Use Pike 8 features
 - Document functions with `//!` comments
 - Handle errors gracefully (no silent `catch {}`)
+- Use `LSP.Compat.pike_version()` for version detection instead of checking `__REAL_VERSION__` directly
+- For version-specific code, use `Compat.pmod` polyfills or `#if constant()` checks
 
 ```pike
 //! Parse the given code and return symbols.
@@ -194,7 +260,7 @@ async function parse(code: string, filename?: string): Promise<PikeParseResult>
 protected mapping handle_parse(mapping params)
 ```
 
-## 🏗️ Architecture Guidelines
+## Architecture Guidelines
 
 ### Adding New LSP Features
 
@@ -223,12 +289,12 @@ Add new constants to `constants/index.ts`:
 export const MY_NEW_CONSTANT = 100;
 ```
 
-## 🐛 Reporting Issues
+## Reporting Issues
 
 ### Bug Reports
 
 Include:
-1. Pike version (`pike --version`)
+1. **Pike version** (`pike --version`) - always include exact output
 2. Node.js version (`node --version`)
 3. VS Code version
 4. Steps to reproduce
@@ -242,7 +308,7 @@ Describe:
 2. Your proposed solution
 3. Alternatives you've considered
 
-## 📦 Release Process
+## Release Process
 
 1. Update version in `packages/vscode-pike/package.json`
 2. Update `CHANGELOG.md`
@@ -253,9 +319,9 @@ Describe:
 7. Push with tags: `git push origin main --tags`
 8. Create GitHub release with .vsix file
 
-## ❓ Questions?
+## Questions
 
 - Open a GitHub issue
 - Check existing issues and PRs
 
-Thank you for contributing! 🎉
+Thank you for contributing.

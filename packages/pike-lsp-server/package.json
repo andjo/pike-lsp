@@ -1,31 +1,35 @@
 {
-    "name": "@pike-lsp/pike-lsp-server",
-    "version": "1.0.0",
-    "description": "Pike Language Server Protocol implementation",
-    "type": "module",
-    "main": "./dist/server.js",
-    "types": "./dist/server.d.ts",
-    "bin": {
-        "pike-lsp-server": "./dist/server.js"
-    },
-    "scripts": {
-        "build": "tsc",
-        "clean": "rm -rf dist",
-        "watch": "tsc --watch",
-        "test": "pnpm build && node --test dist/workspace-index.test.js",
-        "typecheck": "tsc --noEmit"
-    },
-    "dependencies": {
-        "@pike-lsp/pike-bridge": "workspace:*",
-        "@pike-lsp/pike-analyzer": "workspace:*",
-        "vscode-languageserver": "^9.0.1",
-        "vscode-languageserver-textdocument": "^1.0.11"
-    },
-    "devDependencies": {
-        "@types/node": "^20.10.0",
-        "typescript": "^5.3.0"
-    },
-    "engines": {
-        "node": ">=18.0.0"
-    }
+  "name": "@pike-lsp/pike-lsp-server",
+  "version": "0.1.0-alpha.19",
+  "description": "Pike Language Server Protocol implementation",
+  "type": "module",
+  "main": "./dist/server.js",
+  "types": "./dist/server.d.ts",
+  "bin": {
+    "pike-lsp-server": "./dist/server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:roxen-data": "bun run scripts/build-roxen-data.ts",
+    "prebuild": "bun run build:roxen-data",
+    "clean": "rm -rf dist",
+    "watch": "tsc --watch",
+    "test": "bun test",
+    "test:smoke": "bun test src/tests/",
+    "typecheck": "tsc --noEmit",
+    "benchmark": "bun benchmarks/runner.ts"
+  },
+  "dependencies": {
+    "@pike-lsp/core": "workspace:^",
+    "@pike-lsp/pike-bridge": "workspace:^",
+    "htmlparser2": "^10.1.0",
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-textdocument": "^1.0.11"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "glob": "^13.0.1",
+    "mitata": "^1.0.34",
+    "typescript": "^5.3.0"
+  }
 }

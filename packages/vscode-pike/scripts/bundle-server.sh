@@ -32,7 +32,7 @@ fi
 # Ensure pike-bridge dist is up to date (esbuild resolves package main)
 if [ -d "$BRIDGE_DIR" ]; then
     echo "  Building pike-bridge..."
-    (cd "$BRIDGE_DIR" && pnpm build)
+    (cd "$BRIDGE_DIR" && bun run build)
 else
     echo "ERROR: pike-bridge not found at $BRIDGE_DIR"
     exit 1
@@ -47,13 +47,52 @@ npx esbuild "$SERVER_ENTRY" \
     --format=cjs \
     --outfile="$SERVER_DIR/server.js" \
     --external:vscode \
-    --sourcemap \
-    --minify
+    --minify \
+    --define:import.meta.url='undefined'
+
+# Remove source map if it was created
+rm -f "$SERVER_DIR/server.js.map"
 
 # Copy pike-scripts (analyzer.pike and type-introspector.pike)
 if [ -d "$PIKE_SCRIPTS_SRC" ]; then
     echo "  Copying pike-scripts from $PIKE_SCRIPTS_SRC"
-    cp "$PIKE_SCRIPTS_SRC"/*.pike "$SERVER_DIR/pike-scripts/"
+    # Copy only non-test .pike files (exclude test_*.pike and verify_*.pike)
+    for f in "$PIKE_SCRIPTS_SRC"/*.pike; do
+        filename=$(basename "$f")
+        # Skip test files
+        if [[ "$filename" != test_* ]] && [[ "$filename" != verify_* ]]; then
+            cp "$f" "$SERVER_DIR/pike-scripts/"
+        fi
+    done
+
+    # Also copy LSP.pmod modules if they exist
+    if [ -d "$PIKE_SCRIPTS_SRC/LSP.pmod" ]; then
+        echo "  Copying LSP.pmod modules"
+        mkdir -p "$SERVER_DIR/pike-scripts/LSP.pmod"
+        # Copy .pike files
+        cp "$PIKE_SCRIPTS_SRC/LSP.pmod"/*.pike "$SERVER_DIR/pike-scripts/LSP.pmod/" 2>/dev/null || true
+        # Copy .pmod files (single files, not directories)
+        for f in "$PIKE_SCRIPTS_SRC/LSP.pmod"/*.pmod; do
+            if [ -f "$f" ]; then
+                cp "$f" "$SERVER_DIR/pike-scripts/LSP.pmod/"
+            fi
+        done
+        # Copy .pmod directories recursively (Intelligence.pmod/, Analysis.pmod/, etc.)
+        for d in "$PIKE_SCRIPTS_SRC/LSP.pmod"/*.pmod; do
+            if [ -d "$d" ]; then
+                echo "    Copying directory: $(basename "$d")"
+                cp -r "$d" "$SERVER_DIR/pike-scripts/LSP.pmod/"
+            fi
+        done
+    fi
+
+    # BUILD-001: Inject Build ID (hash of timestamp, 6 hex chars)
+    TIMESTAMP=$(date +%s%N 2>/dev/null || date +%s)000000000
+    BUILD_ID=$(echo -n "$TIMESTAMP" | md5sum | cut -c1-6)
+    echo "  Injecting Build ID: $BUILD_ID"
+    # Use perl for in-place replacement to avoid sed portability issues between macOS/Linux
+    perl -i -pe "s/constant BUILD_ID = \"DEV_BUILD\";/constant BUILD_ID = \"$BUILD_ID\";/g" "$SERVER_DIR/pike-scripts/analyzer.pike"
+
 else
     echo "ERROR: pike-scripts not found at $PIKE_SCRIPTS_SRC"
     exit 1

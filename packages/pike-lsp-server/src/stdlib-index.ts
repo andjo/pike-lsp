@@ -10,7 +10,10 @@
 
 import type { PikeBridge } from '@pike-lsp/pike-bridge';
 import type { IntrospectedSymbol, InheritanceInfo } from '@pike-lsp/pike-bridge';
+import { Logger } from '@pike-lsp/core';
 import { MAX_STDLIB_MODULES } from './constants/index.js';
+
+const log = new Logger('StdlibIndex');
 
 /**
  * Information about a stdlib module
@@ -22,8 +25,14 @@ export interface StdlibModuleInfo {
     /** Symbols in the module (lazy loaded) */
     symbols?: Map<string, IntrospectedSymbol>;
 
-    /** Source file path */
+    /** Source file path (may include line number suffix like "file.pike:42") */
     resolvedPath?: string;
+
+    /** Source file path without line number */
+    filePath?: string;
+
+    /** Line number within the file (0-based for LSP) */
+    line?: number;
 
     /** Inheritance information */
     inherits?: InheritanceInfo[];
@@ -76,6 +85,7 @@ export class StdlibIndexManager {
         evictions: 0,
         negativeHits: 0,
     };
+
 
     constructor(bridge: PikeBridge, options?: { maxCacheSize?: number; maxMemoryMB?: number }) {
         this.bridge = bridge;
@@ -177,6 +187,30 @@ export class StdlibIndexManager {
     }
 
     /**
+     * Parse a path that may contain a line number suffix.
+     * Pike returns paths like "/path/to/file.pike:42" where 42 is the line number.
+     * @param path - Path potentially with line number suffix
+     * @returns Object with filePath and line (0-based for LSP)
+     */
+    private parsePathWithLine(path: string): { filePath: string; line: number } {
+        const colonIndex = path.lastIndexOf(':');
+        if (colonIndex !== -1) {
+            // Check if the part after the last colon is a number (line number)
+            const afterColon = path.slice(colonIndex + 1);
+            if (/^\d+$/.test(afterColon)) {
+                // It's a line number (Pike uses 1-based lines)
+                const line = parseInt(afterColon, 10);
+                return {
+                    filePath: path.slice(0, colonIndex),
+                    line: Math.max(0, line - 1), // Convert to 0-based for LSP
+                };
+            }
+        }
+        // No line number found
+        return { filePath: path, line: 0 };
+    }
+
+    /**
      * Load module from Pike
      */
     private async loadModule(modulePath: string): Promise<StdlibModuleInfo | null> {
@@ -191,9 +225,27 @@ export class StdlibIndexManager {
 
             // Convert arrays to Maps
             const symbols = new Map<string, IntrospectedSymbol>();
+
+            // Merge all symbol arrays (symbols, functions, variables, classes)
+            // Pike's resolve_stdlib returns these separately, not as a unified symbols array
             if (result.symbols) {
                 for (const symbol of result.symbols) {
-                    symbols.set(symbol.name, symbol);
+                    if (symbol.name) symbols.set(symbol.name, symbol);
+                }
+            }
+            if (result.functions) {
+                for (const symbol of result.functions) {
+                    if (symbol.name) symbols.set(symbol.name, symbol);
+                }
+            }
+            if (result.variables) {
+                for (const symbol of result.variables) {
+                    if (symbol.name) symbols.set(symbol.name, symbol);
+                }
+            }
+            if (result.classes) {
+                for (const symbol of result.classes) {
+                    if (symbol.name) symbols.set(symbol.name, symbol);
                 }
             }
 
@@ -208,9 +260,12 @@ export class StdlibIndexManager {
                 sizeBytes,
             };
 
-            // Add optional properties only if they exist
+            // Parse the path to extract line number
             if (result.path) {
-                moduleInfo.resolvedPath = result.path;
+                const { filePath, line } = this.parsePathWithLine(result.path);
+                moduleInfo.resolvedPath = result.path; // Keep original with line number
+                moduleInfo.filePath = filePath; // Without line number
+                moduleInfo.line = line; // 0-based for LSP
             }
             if (result.inherits) {
                 moduleInfo.inherits = result.inherits;
@@ -221,7 +276,7 @@ export class StdlibIndexManager {
 
             return moduleInfo;
         } catch (error) {
-            console.error(`Failed to load stdlib module ${modulePath}:`, error);
+            log.error(`Failed to load stdlib module ${modulePath}:`, error as Error);
             // Add to negative cache on error too
             this.negativeCache.add(modulePath);
             return null;

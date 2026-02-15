@@ -5,11 +5,12 @@
  * tokenization, and symbol extraction using Pike's native utilities.
  */
 
-import { spawn, ChildProcess } from 'child_process';
+import { spawn } from 'child_process';
 import { EventEmitter } from 'events';
 import * as path from 'path';
-import * as readline from 'readline';
+import * as fs from 'fs';
 import { fileURLToPath } from 'url';
+import { PikeProcess } from './process.js';
 import type {
     PikeParseResult,
     PikeToken,
@@ -17,8 +18,16 @@ import type {
     PikeDiagnostic,
     PikeRequest,
     PikeResponse,
+    PikeVersionInfo,
+    AnalyzeResponse,
+    AnalysisOperation,
+    PreprocessorBlock,
 } from './types.js';
-import { BRIDGE_TIMEOUT_DEFAULT, BATCH_PARSE_MAX_SIZE } from './constants.js';
+import { BRIDGE_TIMEOUT_DEFAULT, BATCH_PARSE_MAX_SIZE, PROCESS_STARTUP_DELAY, GRACEFUL_SHUTDOWN_DELAY } from './constants.js';
+import { Logger } from '@pike-lsp/core';
+import { PikeError } from '@pike-lsp/core';
+import { RateLimiter } from './rate-limiter.js';
+import { assertString, assertNumber, assertStringArray, type ResponseValidator } from './response-validator.js';
 
 /**
  * Configuration options for the PikeBridge.
@@ -33,6 +42,24 @@ export interface PikeBridgeOptions {
     /** Enable debug logging to stderr. */
     debug?: boolean;
     env?: NodeJS.ProcessEnv
+    /** Rate limiting options (disabled by default). */
+    rateLimit?: {
+        /** Maximum number of requests allowed. Defaults to 100. */
+        maxRequests?: number;
+        /** Time window in seconds. Defaults to 10. */
+        windowSeconds?: number;
+    };
+}
+
+/**
+ * Internal options with all required properties (as used internally).
+ */
+interface InternalBridgeOptions {
+    pikePath: string;
+    analyzerPath: string;
+    timeout: number;
+    debug: boolean;
+    env: NodeJS.ProcessEnv;
 }
 
 /**
@@ -60,6 +87,30 @@ interface PendingRequest {
 }
 
 /**
+ * Cached tokenization data for a document
+ * PERF-003: Only splitTokens are cached since PikeToken objects are not JSON-serializable
+ */
+interface CachedTokens {
+    /** Document version (LSP version number) */
+    version: number;
+    /** Split tokens from Parser.Pike.split (JSON-serializable string array) */
+    splitTokens: string[];
+    /** Cache timestamp for LRU eviction */
+    timestamp: number;
+}
+
+/**
+ * PERF-007: Metrics for batch parse operations
+ */
+interface BatchParseMetrics {
+    totalMs: number;
+    chunkingMs: number;
+    ipcMs: number;
+    chunkCount: number;
+    fileCount: number;
+}
+
+/**
  * PikeBridge - Communication layer with Pike subprocess.
  *
  * Manages a Pike subprocess that provides parsing, tokenization, and symbol
@@ -76,43 +127,86 @@ interface PendingRequest {
  * ```
  */
 export class PikeBridge extends EventEmitter {
-    private process: ChildProcess | null = null;
+    private process: PikeProcess | null = null;
     private requestId = 0;
     private pendingRequests = new Map<number, PendingRequest>();
-    private inflightRequests = new Map<string, Promise<unknown>>();
-    private readline: readline.Interface | null = null;
-    private readonly options: Required<PikeBridgeOptions>;
+    private requestCache = new Map<string, Promise<unknown>>();
+    /** PERF-003: Tokenization cache for completion context */
+    private tokenCache = new Map<string, CachedTokens>();
+    /** PERF-003: Maximum number of cached documents */
+    private readonly MAX_TOKEN_CACHE_SIZE = 50;
+
+    /** Internal options (excluding rateLimit which is handled separately) */
+    private readonly options: InternalBridgeOptions;
+
     private started = false;
+    private readonly logger = new Logger('PikeBridge');
     private debugLog: (message: string) => void;
+    private rateLimiter: RateLimiter | null;
 
     constructor(options: PikeBridgeOptions = {}) {
         super();
 
-        // Default analyzer path relative to this file (ESM-compatible)
-        const resolvedFilename =
-            typeof __filename === 'string' ? __filename : fileURLToPath(import.meta.url);
-        const resolvedDirname = path.dirname(resolvedFilename);
-        const defaultAnalyzerPath = path.resolve(
-            resolvedDirname,
-            '..',
-            '..',
-            '..',
-            'pike-scripts',
-            'analyzer.pike'
-        );
-
         const debug = options.debug ?? false;
         this.debugLog = debug
-            ? (message: string) => console.error(`[PikeBridge DEBUG] ${message}`)
+            ? (message: string) => this.logger.error(`[DEBUG] ${message}`)
             : () => {};
+
+        // Determine analyzer path
+        // If provided in options, use it. Otherwise, search for pike-scripts directory.
+        let defaultAnalyzerPath: string;
+        if (options.analyzerPath) {
+            // Use provided path directly, skip search
+            defaultAnalyzerPath = options.analyzerPath;
+            this.debugLog(`Using provided analyzer path: ${defaultAnalyzerPath}`);
+        } else {
+            // Search for pike-scripts directory relative to this file
+            // ESM-compatible path resolution
+            const modulePath = fileURLToPath(import.meta.url);
+            const resolvedDirname = path.dirname(modulePath);
+            this.debugLog(`Searching for pike-scripts from: ${resolvedDirname}`);
+
+            // Search upward for the pike-scripts directory (handles both workspace and package layouts)
+            defaultAnalyzerPath = path.resolve('pike-scripts', 'analyzer.pike'); // fallback
+            let searchPath = resolvedDirname;
+            let attempts = 0;
+            const maxAttempts = 10;
+
+            while (attempts < maxAttempts) {
+                const candidate = path.resolve(searchPath, 'pike-scripts', 'analyzer.pike');
+                if (fs.existsSync(candidate)) {
+                    defaultAnalyzerPath = candidate;
+                    this.debugLog(`Found pike-scripts at: ${defaultAnalyzerPath}`);
+                    break;
+                }
+                const parent = path.resolve(searchPath, '..');
+                if (parent === searchPath) {
+                    // Reached filesystem root
+                    break;
+                }
+                searchPath = parent;
+                attempts++;
+            }
+        }
 
         this.options = {
             pikePath: options.pikePath ?? 'pike',
-            analyzerPath: options.analyzerPath ?? defaultAnalyzerPath,
+            analyzerPath: defaultAnalyzerPath,
             timeout: options.timeout ?? BRIDGE_TIMEOUT_DEFAULT,
             debug,
             env: options.env ?? {},
         };
+
+        // Initialize rate limiter if configured (disabled by default)
+        if (options.rateLimit) {
+            const maxRequests = options.rateLimit.maxRequests ?? 100;
+            const windowSeconds = options.rateLimit.windowSeconds ?? 10;
+            const refillRate = maxRequests / windowSeconds;
+            this.rateLimiter = new RateLimiter(maxRequests, refillRate);
+            this.debugLog(`Rate limiter enabled: ${maxRequests} requests per ${windowSeconds}s`);
+        } else {
+            this.rateLimiter = null;
+        }
 
         this.debugLog(`Initialized with pikePath="${this.options.pikePath}", analyzerPath="${this.options.analyzerPath}"`);
     }
@@ -134,65 +228,66 @@ export class PikeBridge extends EventEmitter {
 
         this.debugLog(`Starting Pike subprocess: ${this.options.pikePath} ${this.options.analyzerPath}`);
         this.emit('stderr', 'Env: ' + JSON.stringify(this.options.env));
-        
+
+        const pikeProc = new PikeProcess();
+
         return new Promise((resolve, reject) => {
-            try {
-                this.process = spawn(this.options.pikePath, [this.options.analyzerPath], {
-                    stdio: ['pipe', 'pipe', 'pipe'],
-                    env: {...process.env, ...this.options.env}
-                });
+            // Set up event handlers before spawning
+            pikeProc.once('error', (err) => {
+                this.debugLog(`Process error event: ${err.message}`);
+                this.started = false;
+                reject(new Error(`Failed to start Pike subprocess: ${err.message}`));
+            });
 
-                this.debugLog(`Pike subprocess spawned with PID: ${this.process.pid}`);
+            // Forward stderr events
+            pikeProc.on('stderr', (data) => {
+                const message = data.trim();
+                if (message) {
+                    // Filter out false positive warnings from Pike's native parser
+                    // These occur when parsing Pike's own stdlib which contains mixed C/Pike code
+                    const suppressedPatterns = [
+                        /^Illegal comment/,
+                        /^Missing ['"]>?['"]\)/,
+                    ];
+                    const isSuppressed = suppressedPatterns.some(p => p.test(message));
 
-                if (!this.process.stdout || !this.process.stdin) {
-                    const error = 'Failed to create Pike subprocess pipes';
-                    this.debugLog(`ERROR: ${error}`);
-                    reject(new Error(error));
-                    return;
-                }
-
-                // Set up readline interface for reading responses
-                this.readline = readline.createInterface({
-                    input: this.process.stdout,
-                    crlfDelay: Infinity,
-                });
-
-                this.readline.on('line', (line) => {
-                    this.debugLog(`Received line: ${line.substring(0, 100)}...`);
-                    this.handleResponse(line);
-                });
-
-                this.process.stderr?.on('data', (data: Buffer) => {
-                    // Log Pike warnings/errors but don't fail
-                    const message = data.toString().trim();
-                    if (message) {
-                        this.debugLog(`STDERR: ${message}`);
+                    if (!isSuppressed) {
+                        this.logger.debug('Pike stderr', { raw: message });
                         this.emit('stderr', message);
+                    } else {
+                        this.logger.trace('Pike stderr (suppressed)', { raw: message });
                     }
-                });
+                }
+            });
 
-                this.process.on('close', (code) => {
-                    this.debugLog(`Process closed with code: ${code}`);
-                    this.started = false;
-                    this.process = null;
-                    this.readline = null;
-                    this.emit('close', code);
+            // Handle message events (JSON-RPC responses)
+            pikeProc.on('message', (line) => {
+                this.debugLog(`Received line: ${line.substring(0, 100)}...`);
+                this.handleResponse(line);
+            });
 
-                    // Reject all pending requests
-                    for (const [_id, pending] of this.pendingRequests) {
-                        clearTimeout(pending.timeout);
-                        const error = new Error(`Pike process exited with code ${code}`);
-                        this.debugLog(`Rejecting pending request: ${error.message}`);
-                        pending.reject(error);
-                    }
-                    this.pendingRequests.clear();
-                });
+            // Handle exit events - reject pending requests
+            pikeProc.on('exit', (code) => {
+                this.debugLog(`Process closed with code: ${code}`);
+                this.started = false;
+                this.process = null;
+                this.emit('close', code);
 
-                this.process.on('error', (err) => {
-                    this.debugLog(`Process error event: ${err.message}`);
-                    this.started = false;
-                    reject(new Error(`Failed to start Pike subprocess: ${err.message}`));
-                });
+                // Reject all pending requests
+                for (const [_id, pending] of this.pendingRequests) {
+                    clearTimeout(pending.timeout);
+                    const error = new PikeError(`Pike process exited with code ${code}`);
+                    this.debugLog(`Rejecting pending request: ${error.message}`);
+                    pending.reject(error);
+                }
+                this.pendingRequests.clear();
+            });
+
+            // Spawn the process
+            try {
+                pikeProc.spawn(this.options.analyzerPath, this.options.pikePath, this.options.env);
+                this.debugLog(`Pike subprocess spawned with PID: ${pikeProc.pid}`);
+                this.process = pikeProc;
 
                 // Give the process a moment to start
                 setTimeout(() => {
@@ -200,7 +295,7 @@ export class PikeBridge extends EventEmitter {
                     this.debugLog('Pike subprocess started successfully');
                     this.emit('started');
                     resolve();
-                }, 100);
+                }, PROCESS_STARTUP_DELAY);
             } catch (err) {
                 const message = err instanceof Error ? err.message : String(err);
                 this.debugLog(`Exception during start: ${message}`);
@@ -220,32 +315,17 @@ export class PikeBridge extends EventEmitter {
      */
     async stop(): Promise<void> {
         if (this.process) {
-            const proc = this.process;
             this.debugLog('Stopping Pike subprocess...');
+            const proc = this.process;
 
-            // Close stdin to signal end of input
-            proc.stdin?.end();
+            // Graceful shutdown via PikeProcess
+            proc.kill();
 
-            // Send SIGTERM for graceful shutdown
-            proc.kill('SIGTERM');
+            // Wait a moment for cleanup
+            await new Promise(resolve => setTimeout(resolve, GRACEFUL_SHUTDOWN_DELAY));
 
-            // Wait for process to terminate gracefully, or force kill after timeout
-            const terminated = await new Promise<boolean>((resolve) => {
-                const timeout = setTimeout(() => {
-                    this.debugLog('Process did not terminate gracefully, sending SIGKILL');
-                    proc.kill('SIGKILL');
-                    resolve(false);
-                }, 2000); // 2 second grace period
-
-                proc.once('close', () => {
-                    clearTimeout(timeout);
-                    resolve(true);
-                });
-            });
-
-            this.debugLog(`Pike subprocess ${terminated ? 'terminated gracefully' : 'was killed forcefully'}`);
+            this.debugLog('Pike subprocess stopped');
             this.process = null;
-            this.readline = null;
             this.started = false;
         }
         this.emit('stopped');
@@ -257,7 +337,7 @@ export class PikeBridge extends EventEmitter {
      * @returns `true` if the subprocess is started and connected.
      */
     isRunning(): boolean {
-        return this.started && this.process !== null;
+        return this.started && this.process !== null && this.process.isAlive();
     }
 
     /**
@@ -270,17 +350,22 @@ export class PikeBridge extends EventEmitter {
     /**
      * Send a request to the Pike subprocess with deduplication
      */
-    private async sendRequest<T>(method: string, params: Record<string, unknown>): Promise<T> {
+    private async sendRequest<T>(method: string, params: Record<string, unknown>, validate?: ResponseValidator<T>): Promise<T> {
+        // Check rate limit (if configured)
+        if (this.rateLimiter && !this.rateLimiter.tryAcquire()) {
+            throw new PikeError('Rate limit exceeded');
+        }
+
         // Check for inflight request with same method and params
         const requestKey = this.getRequestKey(method, params);
-        const existing = this.inflightRequests.get(requestKey);
+        const existing = this.requestCache.get(requestKey);
 
         if (existing) {
             // Reuse the existing inflight request
             return existing as Promise<T>;
         }
 
-        if (!this.process?.stdin || !this.started) {
+        if (!this.process || !this.process.isAlive() || !this.started) {
             await this.start();
         }
 
@@ -290,7 +375,7 @@ export class PikeBridge extends EventEmitter {
 
             const timeout = setTimeout(() => {
                 this.pendingRequests.delete(id);
-                reject(new Error(`Request ${id} timed out after ${this.options.timeout}ms`));
+                reject(new PikeError(`Request ${id} timed out after ${this.options.timeout}ms`));
             }, this.options.timeout);
 
             this.pendingRequests.set(id, {
@@ -302,16 +387,21 @@ export class PikeBridge extends EventEmitter {
             const request: PikeRequest = { id, method: method as PikeRequest['method'], params };
             const json = JSON.stringify(request);
 
-            this.process?.stdin?.write(json + '\n');
+            this.process?.send(json);
         });
 
         // Track as inflight
-        this.inflightRequests.set(requestKey, promise);
+        this.requestCache.set(requestKey, promise);
 
         // Remove from inflight when done (success or failure)
         promise.finally(() => {
-            this.inflightRequests.delete(requestKey);
+            this.requestCache.delete(requestKey);
         });
+
+        // Apply runtime response validation if provided
+        if (validate) {
+            return promise.then(result => validate(result as unknown, method));
+        }
 
         return promise;
     }
@@ -324,19 +414,75 @@ export class PikeBridge extends EventEmitter {
             const response: PikeResponse = JSON.parse(line);
             const pending = this.pendingRequests.get(response.id);
 
-            if (pending) {
-                clearTimeout(pending.timeout);
-                this.pendingRequests.delete(response.id);
-
-                if (response.error) {
-                    pending.reject(new Error(response.error.message));
-                } else {
-                    pending.resolve(response.result);
-                }
+            if (!pending) {
+                return; // No pending request for this response
             }
+
+            clearTimeout(pending.timeout);
+            this.pendingRequests.delete(response.id);
+
+            if (response.error) {
+                this.rejectPendingRequest(pending, response.error.message);
+                return;
+            }
+
+            const result = this.buildResponseResult(response);
+            pending.resolve(result);
         } catch {
             // Ignore non-JSON lines (might be Pike debug output)
             this.emit('stderr', line);
+        }
+    }
+
+    /**
+     * Build the result object from a Pike response, attaching _perf metadata.
+     */
+    private buildResponseResult(response: PikeResponse): unknown {
+        const perf = (response as any)._perf || {};
+        const result = response.result;
+
+        if (this.isAnalyzeResponse(response)) {
+            // Return full response structure for analyze requests
+            const fullResponse = {
+                result,
+                failures: (response as any).failures || {},
+                _perf: perf,
+            };
+            // Copy _perf into result as well for backward compatibility
+            this.attachPerformanceMetadata(fullResponse.result, perf);
+            return fullResponse;
+        }
+
+        // For other requests, return the result with _perf attached
+        this.attachPerformanceMetadata(result, perf);
+        return result;
+    }
+
+    /**
+     * Check if response is an analyze response (contains failures object).
+     */
+    private isAnalyzeResponse(response: PikeResponse): boolean {
+        return 'failures' in response && typeof (response as any).failures === 'object';
+    }
+
+    /**
+     * Reject a pending request with a PikeError.
+     */
+    private rejectPendingRequest(pending: PendingRequest, message: string): void {
+        const error = new PikeError(
+            message || 'Pike request failed',
+            new Error(message)
+        );
+        pending.reject(error);
+    }
+
+    /**
+     * Attach performance metadata to a result object if applicable.
+     * Used to attach _perf data for timing and debugging information.
+     */
+    private attachPerformanceMetadata(result: unknown, perf: Record<string, unknown>): void {
+        if (typeof result === 'object' && result !== null && Object.keys(perf).length > 0) {
+            (result as Record<string, unknown>)['_perf'] = perf;
         }
     }
 
@@ -451,28 +597,82 @@ export class PikeBridge extends EventEmitter {
     }
 
     /**
-     * Introspect Pike code through compilation.
+     * Resolve an #include path to an absolute file location.
      *
-     * Compiles the code and uses Pike's `_typeof` operator to extract
-     * full type information via runtime introspection. Provides complete
-     * type signatures for functions, classes, and variables.
+     * Resolves #include directives to actual file system paths.
+     * Handles relative includes (e.g., "utils.pike") and system includes
+     * (e.g., <Stdio.h>).
      *
-     * @param code - Pike source code to introspect.
-     * @param filename - Optional filename for error messages.
-     * @returns Introspection result with detailed type information.
+     * @param includePath - Path from #include directive (with or without quotes/brackets).
+     * @param currentFile - Current file path for resolving relative includes.
+     * @returns Include resolve result with path and existence flag.
      * @example
      * ```ts
-     * const result = await bridge.introspect('class Foo { int bar(); }');
-     * console.log(result.symbols[0].type); // "function(int:void)"
+     * const result = await bridge.resolveInclude('utils.pike', '/path/to/current.pike');
+     * // Returns: { path: '/path/to/utils.pike', exists: true, originalPath: 'utils.pike' }
      * ```
      */
-    async introspect(code: string, filename?: string): Promise<import('./types.js').IntrospectionResult> {
-        const result = await this.sendRequest<import('./types.js').IntrospectionResult>('introspect', {
+    async resolveInclude(includePath: string, currentFile?: string): Promise<import('./types.js').IncludeResolveResult> {
+        return this.sendRequest<import('./types.js').IncludeResolveResult>('resolve_include', {
+            includePath,
+            currentFile: currentFile || undefined,
+        }, (raw, method) => {
+            const r = raw as Record<string, unknown>;
+            assertString(r['path'], 'path', method);
+            return r as unknown as import('./types.js').IncludeResolveResult;
+        });
+    }
+
+    /**
+     * Unified analyze - consolidate multiple Pike operations in one request.
+     *
+     * Performs compilation and tokenization once, then distributes results
+     * to all requested operation types. More efficient than calling parse(),
+     * introspect(), and analyzeUninitialized() separately.
+     *
+     * Supports partial success - each requested operation appears in either
+     * result or failures, never both. Use failures?.[operation] for O(1) lookup.
+     *
+     * @param code - Pike source code to analyze.
+     * @param filename - Optional filename for error messages.
+     * @param include - Which operations to perform (at least one required).
+     * @param documentVersion - Optional LSP document version (for cache invalidation).
+     *                          If provided, cache uses LSP version instead of file stat.
+     * @returns Analyze response with result/failures structure and performance timing.
+     * @example
+     * ```ts
+     * const response = await bridge.analyze(
+     *     'class Foo { int bar() { return 5; } }',
+     *     'example.pike',
+     *     ['parse', 'introspect', 'diagnostics']
+     * );
+     *
+     * // Check for specific operation success
+     * if (response.result?.introspect) {
+     *     console.log(response.result.introspect.symbols);
+     * }
+     *
+     * // Check for specific operation failure
+     * if (response.failures?.diagnostics) {
+     *     console.error(response.failures.diagnostics.message);
+     * }
+     *
+     * // Access performance timing
+     * console.log(`Compilation took ${response._perf?.compilation_ms}ms`);
+     * ```
+     */
+    async analyze(
+        code: string,
+        include: AnalysisOperation[],
+        filename?: string,
+        documentVersion?: number
+    ): Promise<AnalyzeResponse> {
+        return this.sendRequest<AnalyzeResponse>('analyze', {
             code,
             filename: filename ?? 'input.pike',
+            include,
+            version: documentVersion,  // Pass LSP version for cache key
         });
-
-        return result;
     }
 
     /**
@@ -498,6 +698,29 @@ export class PikeBridge extends EventEmitter {
     }
 
     /**
+     * Query Pike's runtime include and module paths.
+     *
+     * Returns the current include and module paths from Pike's master(),
+     * useful for resolving #include directives and module imports.
+     *
+     * @returns Pike runtime paths with include_paths and module_paths arrays.
+     * @example
+     * ```ts
+     * const paths = await bridge.getPikePaths();
+     * console.log(paths.include_paths); // [".", "/usr/local/pike/..."]
+     * console.log(paths.module_paths); // ["/usr/local/pike/..."]
+     * ```
+     */
+    async getPikePaths(): Promise<import('./types.js').PikePathsResult> {
+        return this.sendRequest<import('./types.js').PikePathsResult>('get_pike_paths', {}, (raw, method) => {
+            const r = raw as Record<string, unknown>;
+            assertStringArray(r['include_paths'], 'include_paths', method);
+            assertStringArray(r['module_paths'], 'module_paths', method);
+            return r as unknown as import('./types.js').PikePathsResult;
+        });
+    }
+
+    /**
      * Get inherited members from a class.
      *
      * Returns all members (methods, variables, constants) that a class
@@ -517,6 +740,115 @@ export class PikeBridge extends EventEmitter {
         });
 
         return result;
+    }
+
+    /**
+     * Extract import/include/inherit/require directives from Pike code.
+     *
+     * Parses Pike source code and extracts all module import directives,
+     * including preprocessor directives (#include, #require) and keyword
+     * statements (import, inherit).
+     *
+     * @param code - Pike source code to parse.
+     * @param filename - Optional filename for error reporting.
+     * @returns All imports found with their types and line numbers.
+     * @example
+     * ```ts
+     * const result = await bridge.extractImports('import Stdio;\n#include "foo.h"');
+     * console.log(result.imports); // [{ type: 'import', path: 'Stdio', line: 1 }, ...]
+     * ```
+     */
+    async extractImports(code: string, filename?: string): Promise<import('./types.js').ExtractImportsResult> {
+        const params: Record<string, unknown> = { code };
+        if (filename) params['filename'] = filename;
+        return this.sendRequest<import('./types.js').ExtractImportsResult>('extract_imports', params);
+    }
+
+    /**
+     * Resolve an import/include/inherit/require directive to its file path.
+     *
+     * Given an import directive type and target, attempts to resolve it to a
+     * file path. Resolution logic varies by import type:
+     * - INCLUDE: Resolves "local.h" relative to current file, <system.h> via include paths
+     * - IMPORT: Uses Pike's master()->resolv() to find the module
+     * - INHERIT: Multi-strategy resolution (introspection, qualified names, workspace search, stdlib)
+     * - REQUIRE: Tries as module via master()->resolv(), then as file path
+     *
+     * @param importType - Type of import (include, import, inherit, require).
+     * @param target - Module/path name to resolve.
+     * @param currentFile - Optional current file path for relative resolution.
+     * @returns Resolved path with existence status and error info.
+     * @example
+     * ```ts
+     * const result = await bridge.resolveImport('import', 'Stdio');
+     * console.log(result.path); // '/usr/local/pike/lib/modules/Stdio.so'
+     * ```
+     */
+    async resolveImport(
+        importType: import('./types.js').ImportType,
+        target: string,
+        currentFile?: string
+    ): Promise<import('./types.js').ResolveImportResult> {
+        const params: Record<string, unknown> = { import_type: importType, target };
+        if (currentFile) params['current_file'] = currentFile;
+        return this.sendRequest<import('./types.js').ResolveImportResult>('resolve_import', params, (raw, method) => {
+            const r = raw as Record<string, unknown>;
+            assertString(r['path'], 'path', method);
+            assertNumber(r['exists'], 'exists', method);
+            return r as unknown as import('./types.js').ResolveImportResult;
+        });
+    }
+
+    /**
+     * Check for circular dependencies in a dependency graph.
+     *
+     * Performs cycle detection on a dependency graph structure using
+     * depth-first search. Uses three-color DFS (white=unvisited, gray=visiting,
+     * black=visited) to detect cycles efficiently.
+     *
+     * @param code - Pike source code to analyze.
+     * @param filename - Optional filename for the code.
+     * @returns Circular dependency check result with cycle path if found.
+     * @example
+     * ```ts
+     * const result = await bridge.checkCircular('import A;\nimport B;', 'test.pike');
+     * console.log(result.hasCircular); // false
+     * ```
+     */
+    async checkCircular(code: string, filename?: string): Promise<import('./types.js').CircularCheckResult> {
+        const params: Record<string, unknown> = { code };
+        if (filename) params['filename'] = filename;
+        return this.sendRequest<import('./types.js').CircularCheckResult>('check_circular', params);
+    }
+
+    /**
+     * Get symbols with waterfall loading (transitive dependency resolution).
+     *
+     * Performs transitive symbol loading by recursively resolving all
+     * dependencies of the specified file. Implements waterfall pattern where
+     * symbols from dependencies are loaded with depth tracking for proper
+     * prioritization (current file > direct imports > transitive).
+     *
+     * @param code - Pike source code to analyze.
+     * @param filename - Optional filename for resolution context.
+     * @param maxDepth - Maximum depth for transitive resolution (default: 5).
+     * @returns All symbols with provenance tracking and merge precedence applied.
+     * @example
+     * ```ts
+     * const result = await bridge.getWaterfallSymbols('import Stdio;', 'test.pike', 3);
+     * console.log(result.symbols); // All symbols from file + imports
+     * console.log(result.provenance); // Where each symbol came from
+     * ```
+     */
+    async getWaterfallSymbols(
+        code: string,
+        filename?: string,
+        maxDepth?: number
+    ): Promise<import('./types.js').WaterfallSymbolsResult> {
+        const params: Record<string, unknown> = { code };
+        if (filename) params['filename'] = filename;
+        if (maxDepth !== undefined) params['max_depth'] = maxDepth;
+        return this.sendRequest<import('./types.js').WaterfallSymbolsResult>('get_waterfall_symbols', params);
     }
 
     /**
@@ -599,12 +931,83 @@ export class PikeBridge extends EventEmitter {
     }
 
     /**
+     * Parse preprocessor conditional blocks (#if/#else/#endif).
+     *
+     * Extracts the structure of preprocessor directives, including:
+     * - Condition expressions
+     * - Branch line ranges (if/elif/else)
+     * - Nesting depth
+     *
+     * This is used for conditional symbol extraction, where symbols inside
+     * different preprocessor branches are tagged with metadata indicating
+     * which condition they belong to.
+     *
+     * @param code - Pike source code to parse.
+     * @returns Object with blocks array containing preprocessor structure.
+     * @example
+     * ```ts
+     * const result = await bridge.parsePreprocessorBlocks('#if DEBUG\nint x;\n#endif');
+     * console.log(result.blocks[0].condition); // 'DEBUG'
+     * console.log(result.blocks[0].branches[0].startLine); // 2
+     * ```
+     */
+    async parsePreprocessorBlocks(code: string): Promise<{ blocks: PreprocessorBlock[] }> {
+        return this.sendRequest<{ blocks: PreprocessorBlock[] }>('parse_preprocessor_blocks', { code });
+    }
+
+    /**
+     * PERF-003: Clear tokenization cache for a document.
+     * Call when document is modified or closed.
+     *
+     * @param documentUri - URI of the document to invalidate
+     */
+    invalidateTokenCache(documentUri: string): void {
+        this.tokenCache.delete(documentUri);
+        this.debugLog(`Token cache invalidated for ${documentUri}`);
+    }
+
+    /**
+     * PERF-003: Clear all tokenization caches.
+     * Call when clearing all document data.
+     */
+    clearTokenCache(): void {
+        const size = this.tokenCache.size;
+        this.tokenCache.clear();
+        this.debugLog(`Cleared ${size} token cache entries`);
+    }
+
+    /**
+     * PERF-003: Evict oldest cache entries if cache is too large.
+     */
+    private evictOldTokenCacheEntries(): void {
+        if (this.tokenCache.size <= this.MAX_TOKEN_CACHE_SIZE) {
+            return;
+        }
+
+        // Sort by timestamp and remove oldest entries
+        const entries = Array.from(this.tokenCache.entries())
+            .sort((a, b) => a[1].timestamp - b[1].timestamp);
+
+        const toRemove = entries.slice(0, this.tokenCache.size - this.MAX_TOKEN_CACHE_SIZE);
+        for (const [uri] of toRemove) {
+            this.tokenCache.delete(uri);
+        }
+
+        this.debugLog(`Evicted ${toRemove.length} old token cache entries`);
+    }
+
+    /**
      * Get completion context at a specific position using Pike's tokenizer.
      * This replaces regex-based heuristics with Pike's accurate tokenization.
+     *
+     * PERF-003: When documentUri and version are provided, caches tokenization
+     * results to avoid re-tokenizing the entire file on every completion.
      *
      * @param code - Source code to analyze
      * @param line - Line number (1-based)
      * @param character - Character position (0-based)
+     * @param documentUri - Optional document URI for caching
+     * @param documentVersion - Optional LSP document version for cache invalidation
      * @returns Completion context with type, object name, and prefix
      * @example
      * ```ts
@@ -612,33 +1015,119 @@ export class PikeBridge extends EventEmitter {
      * console.log(ctx); // { context: 'member_access', objectName: 'f', prefix: 'w', operator: '->' }
      * ```
      */
-    async getCompletionContext(code: string, line: number, character: number): Promise<import('./types.js').CompletionContext> {
-        const result = await this.sendRequest<import('./types.js').CompletionContext>('get_completion_context', {
+    async getCompletionContext(
+        code: string,
+        line: number,
+        character: number,
+        documentUri?: string,
+        documentVersion?: number
+    ): Promise<import('./types.js').CompletionContext> {
+        // Try to use cached tokenization if document version matches
+        if (documentUri && documentVersion !== undefined) {
+            const cached = this.tokenCache.get(documentUri);
+            if (cached && cached.version === documentVersion) {
+                this.debugLog(`Using cached tokens for ${documentUri} (version ${documentVersion})`);
+
+                // Use cached tokens path
+                try {
+                    const result = await this.sendRequest<import('./types.js').CompletionContext>('get_completion_context_cached', {
+                        code,
+                        line,
+                        character,
+                        splitTokens: cached.splitTokens,
+                    });
+                    return result;
+                } catch (err) {
+                    // If cached path fails, fall through to full tokenization
+                    this.debugLog(`Cached completion context failed, falling back to full tokenization: ${err instanceof Error ? err.message : String(err)}`);
+                }
+            }
+        }
+
+        // Full tokenization needed
+        const result = await this.sendRequest<{
+            splitTokens?: string[];
+        } & import('./types.js').CompletionContext>('get_completion_context', {
             code,
             line,
             character,
         });
 
-        return result;
+        // Cache the splitTokens for future use
+        if (documentUri && documentVersion !== undefined && result.splitTokens) {
+            this.evictOldTokenCacheEntries();
+
+            this.tokenCache.set(documentUri, {
+                version: documentVersion,
+                splitTokens: result.splitTokens,
+                timestamp: Date.now(),
+            });
+            this.debugLog(`Cached tokens for ${documentUri} (version ${documentVersion})`);
+        }
+
+        // Result IS the CompletionContext (sendRequest unwraps the JSON-RPC response)
+        return result as import('./types.js').CompletionContext;
+    }
+
+    // PERF-007: Metrics for batch parse operations
+    private batchParseMetrics: BatchParseMetrics[] = [];
+
+    /**
+     * Get batch parse metrics from recent operations
+     */
+    getBatchParseMetrics(): BatchParseMetrics[] {
+        return [...this.batchParseMetrics];
+    }
+
+    /**
+     * Clear batch parse metrics
+     */
+    clearBatchParseMetrics(): void {
+        this.batchParseMetrics = [];
     }
 
     async batchParse(files: Array<{ code: string; filename: string }>): Promise<import('./types.js').BatchParseResult> {
+        const totalStart = performance.now();
+        const metrics: BatchParseMetrics = {
+            totalMs: 0,
+            chunkingMs: 0,
+            ipcMs: 0,
+            chunkCount: 0,
+            fileCount: files.length,
+        };
+
         // Limit batch size to prevent memory issues
         if (files.length > BATCH_PARSE_MAX_SIZE) {
+            const chunkingStart = performance.now();
             // Split into chunks and process sequentially
             const chunks: Array<typeof files> = [];
             for (let i = 0; i < files.length; i += BATCH_PARSE_MAX_SIZE) {
                 chunks.push(files.slice(i, i + BATCH_PARSE_MAX_SIZE));
             }
+            const chunkingEnd = performance.now();
+            metrics.chunkingMs = chunkingEnd - chunkingStart;
+            metrics.chunkCount = chunks.length;
 
-            // Process chunks and combine results
+            // PERF-007: Time IPC for each chunk
             const allResults: import('./types.js').BatchParseFileResult[] = [];
             for (const chunk of chunks) {
+                const ipcStart = performance.now();
                 const result = await this.sendRequest<import('./types.js').BatchParseResult>('batch_parse', {
                     files: chunk,
                 });
+                const ipcEnd = performance.now();
+                metrics.ipcMs += ipcEnd - ipcStart;
                 allResults.push(...result.results);
             }
+
+            metrics.totalMs = performance.now() - totalStart;
+            this.batchParseMetrics.push(metrics);
+
+            // PERF-007: Log performance data
+            this.logger.info('bridge-batch-parse-perf', {
+                ...metrics,
+                avgIpcMs: (metrics.ipcMs / metrics.chunkCount).toFixed(2),
+            });
 
             return {
                 results: allResults,
@@ -646,7 +1135,23 @@ export class PikeBridge extends EventEmitter {
             };
         }
 
-        return this.sendRequest<import('./types.js').BatchParseResult>('batch_parse', { files });
+        // PERF-007: Time single-batch IPC
+        const ipcStart = performance.now();
+        const result = await this.sendRequest<import('./types.js').BatchParseResult>('batch_parse', { files });
+        const ipcEnd = performance.now();
+
+        metrics.totalMs = performance.now() - totalStart;
+        metrics.ipcMs = ipcEnd - ipcStart;
+        metrics.chunkCount = 1;
+        this.batchParseMetrics.push(metrics);
+
+        // PERF-007: Log performance data
+        this.logger.info('bridge-batch-parse-perf', {
+            ...metrics,
+            avgIpcMs: metrics.ipcMs.toFixed(2),
+        });
+
+        return result;
     }
 
     /**
@@ -664,6 +1169,32 @@ export class PikeBridge extends EventEmitter {
                 resolve(false);
             });
         });
+    }
+
+    /**
+     * Get the Pike version via RPC.
+     *
+     * Queries the running Pike subprocess for its version information.
+     * Returns structured version data including major, minor, build, and display values.
+     *
+     * @returns Version information object or `null` if the bridge is not running or method is not available.
+     * @example
+     * ```ts
+     * const version = await bridge.getVersionInfo();
+     * console.log(version); // { major: 8, minor: 0, build: 1116, version: "8.0.1116", display: 8.01116 }
+     * ```
+     */
+    async getVersionInfo(): Promise<PikeVersionInfo | null> {
+        this.debugLog('Getting Pike version via RPC...');
+        try {
+            const result = await this.sendRequest<PikeVersionInfo>('get_version', {});
+            return result;
+        } catch (err) {
+            // Method not found or bridge not running
+            const message = err instanceof Error ? err.message : String(err);
+            this.debugLog(`getVersionInfo failed: ${message}`);
+            return null;
+        }
     }
 
     /**
@@ -767,17 +1298,272 @@ export class PikeBridge extends EventEmitter {
     }
 
     /**
+     * Validate Roxen module API compliance.
+     *
+     * Performs Roxen-specific validation including:
+     * - Required callbacks per module type
+     * - Defvar TYPE_* constant validation
+     * - Tag function signature validation
+     *
+     * @param code - Pike source code to validate
+     * @param filename - Optional filename for error messages
+     * @param moduleInfo - Optional Roxen module info from parsing
+     * @returns Roxen validation result with diagnostics
+     * @example
+     * ```ts
+     * const result = await bridge.roxenValidate(code, 'test.pike', {
+     *     module_type: ['MODULE_LOCATION'],
+     *     variables: [{ name: 'mountpoint', type: 'TYPE_STRING' }],
+     *     tags: []
+     * });
+     * console.log(result.diagnostics); // Array of validation diagnostics
+     * ```
+     */
+    async roxenValidate(
+        code: string,
+        filename: string,
+        moduleInfo?: Record<string, unknown>
+    ): Promise<import('./types.js').RoxenValidationResult> {
+        const params: Record<string, unknown> = { code, filename };
+        if (moduleInfo) {
+            params['module_info'] = moduleInfo;
+        }
+        return this.sendRequest<import('./types.js').RoxenValidationResult>('roxen_validate', params);
+    }
+
+    /**
+     * Detect Roxen module information in Pike code.
+     *
+     * Analyzes Pike source code to identify Roxen module patterns,
+     * including module type, variables, and RXML tags.
+     *
+     * @param code - Source code to analyze
+     * @param filename - Filename for the document (optional)
+     * @returns Roxen module information
+     *
+     * @example
+     * ```typescript
+     * const bridge = new PikeBridge();
+     * await bridge.start();
+     * const result = await bridge.roxenDetect('inherit "module"; constant module_type = MODULE_TAG;');
+     * console.log(result.is_roxen_module); // 1
+     * console.log(result.module_type); // ['module']
+     * ```
+     */
+    async roxenDetect(
+        code: string,
+        filename?: string
+    ): Promise<import('./types.js').RoxenModuleInfo> {
+        const params: Record<string, unknown> = { code };
+        if (filename) {
+            params['filename'] = filename;
+        }
+        return this.sendRequest<import('./types.js').RoxenModuleInfo>('roxen_detect', params);
+    }
+
+    /**
+     * Parse RXML tag definitions from Roxen module code.
+     *
+     * Extracts simpletag and container function definitions from the code.
+     *
+     * @param code - Pike source code to parse for tag definitions.
+     * @param filename - Optional filename for error reporting.
+     * @returns Object containing array of parsed tag definitions.
+     * @example
+     * ```ts
+     * const result = await bridge.roxenParseTags('string simpletag_hello(mapping args) { return "hi"; }');
+     * console.log(result.tags); // [{ name: 'hello', type: 'simple', ... }]
+     * ```
+     */
+    async roxenParseTags(
+        code: string,
+        filename?: string
+    ): Promise<{ tags: import('./types.js').RXMLTag[] }> {
+        const params: Record<string, unknown> = { code };
+        if (filename) {
+            params['filename'] = filename;
+        }
+        return this.sendRequest<{ tags: import('./types.js').RXMLTag[] }>('roxen_parse_tags', params);
+    }
+
+    /**
+     * Parse defvar calls from Roxen module code.
+     *
+     * Extracts module variable definitions from defvar() calls.
+     *
+     * @param code - Pike source code to parse for variable definitions.
+     * @param filename - Optional filename for error reporting.
+     * @returns Object containing array of parsed variable definitions.
+     * @example
+     * ```ts
+     * const result = await bridge.roxenParseVars('defvar("title", "Default", TYPE_STRING, "Title");');
+     * console.log(result.variables); // [{ name: 'title', name_string: 'Default', type: 'TYPE_STRING', ... }]
+     * ```
+     */
+    async roxenParseVars(
+        code: string,
+        filename?: string
+    ): Promise<{ variables: import('./types.js').ModuleVariable[] }> {
+        const params: Record<string, unknown> = { code };
+        if (filename) {
+            params['filename'] = filename;
+        }
+        return this.sendRequest<{ variables: import('./types.js').ModuleVariable[] }>('roxen_parse_vars', params);
+    }
+
+    /**
+     * Get lifecycle callback information from Roxen module code.
+     *
+     * Detects presence of create(), start(), stop(), and status() callbacks.
+     *
+     * @param code - Pike source code to analyze for lifecycle callbacks.
+     * @param filename - Optional filename for error reporting.
+     * @returns Object containing lifecycle information with detected callbacks.
+     * @example
+     * ```ts
+     * const result = await bridge.roxenGetCallbacks('void create() {} int start() { return 1; }');
+     * console.log(result.lifecycle.has_create); // 1
+     * console.log(result.lifecycle.has_start); // 1
+     * ```
+     */
+    async roxenGetCallbacks(
+        code: string,
+        filename?: string
+    ): Promise<{ lifecycle: import('./types.js').LifecycleInfo }> {
+        const params: Record<string, unknown> = { code };
+        if (filename) {
+            params['filename'] = filename;
+        }
+        return this.sendRequest<{ lifecycle: import('./types.js').LifecycleInfo }>('roxen_get_callbacks', params);
+    }
+
+    /**
+     * Extract RXML strings from Pike multiline string literals.
+     *
+     * Detects and extracts RXML content embedded in Pike code using
+     * #"..." and #'...' multiline string syntax.
+     *
+     * @param code - Pike source code to analyze.
+     * @param filename - Optional filename for error reporting.
+     * @returns Object containing array of detected RXML strings.
+     * @example
+     * ```ts
+     * const result = await bridge.roxenExtractRXMLStrings('string foo = #"<set>bar</set>";');
+     * console.log(result.strings); // [{ content: '<set>bar</set>', confidence: 0.8, ... }]
+     * ```
+     */
+    async roxenExtractRXMLStrings(
+        code: string,
+        filename?: string
+    ): Promise<{ strings: import('./types.js').RXMLStringResult[] }> {
+        const params: Record<string, unknown> = { code };
+        if (filename) {
+            params['filename'] = filename;
+        }
+        return this.sendRequest<{ strings: import('./types.js').RXMLStringResult[] }>('roxenExtractRXMLStrings', params);
+    }
+
+    /**
+     * Get RXML tag catalog from running Roxen server.
+     *
+     * Queries a running Roxen server for available RXML tags.
+     * Returns tag metadata including name, type, and attributes.
+     *
+     * @param serverPid - Optional Roxen server process ID. If not provided, attempts to detect running server.
+     * @returns Array of RXML tag definitions.
+     * @throws Error if server not running or communication fails.
+     * @example
+     * ```ts
+     * // Get tags from specific server
+     * const tags = await bridge.roxenGetTagCatalog(12345);
+     * console.log(tags); // [{ name: 'echo', type: 'simple', ... }]
+     *
+     * // Auto-detect server
+     * const tags = await bridge.roxenGetTagCatalog();
+     * ```
+     */
+    async roxenGetTagCatalog(serverPid?: number): Promise<import('./types.js').RXMLTagCatalogEntry[]> {
+        const params: Record<string, unknown> = {};
+        if (serverPid !== undefined) {
+            params['server_pid'] = serverPid;
+        }
+        const result = await this.sendRequest<{ tags: import('./types.js').RXMLTagCatalogEntry[] }>('roxen_get_tag_catalog', params);
+        return result.tags;
+    }
+
+    /**
      * Get diagnostic information for debugging.
      *
      * Returns the current configuration and state of the bridge.
      *
      * @returns Diagnostic information including options, running state, and PID.
      */
-    getDiagnostics(): { options: Required<PikeBridgeOptions>; isRunning: boolean; pid: number | null } {
+    getDiagnostics(): { options: InternalBridgeOptions; isRunning: boolean; pid: number | null } {
         return {
             options: { ...this.options },
             isRunning: this.isRunning(),
             pid: this.process?.pid ?? null,
         };
+    }
+
+    /**
+     * Get startup phase timing metrics from the Pike subprocess.
+     *
+     * Returns detailed timing information about the analyzer startup process,
+     * useful for performance debugging and optimization.
+     *
+     * @returns Startup metrics with phase timings in milliseconds.
+     * @example
+     * ```ts
+     * const metrics = await bridge.getStartupMetrics();
+     * console.log(`Startup took ${metrics.total}ms`);
+     * console.log(`Context created: ${metrics.context_created}`);
+     * ```
+     */
+    async getStartupMetrics(): Promise<import('./types.js').StartupMetrics> {
+        const result = await this.sendRequest<{ startup: import('./types.js').StartupMetrics }>('get_startup_metrics', {});
+        return result.startup;
+    }
+
+    /**
+     * Get compilation cache statistics from the Pike subprocess.
+     *
+     * Returns cache hit/miss ratios and size information, useful for
+     * debugging cache effectiveness and memory usage.
+     *
+     * @returns Cache statistics including hits, misses, evictions, and size.
+     * @example
+     * ```ts
+     * const stats = await bridge.getCacheStats();
+     * console.log(`Cache hit rate: ${stats.hits / (stats.hits + stats.misses)}`);
+     * ```
+     */
+    async getCacheStats(): Promise<import('./types.js').CacheStats> {
+        return this.sendRequest<import('./types.js').CacheStats>('get_cache_stats', {});
+    }
+
+    /**
+     * Invalidate compilation cache entries for testing or debugging.
+     *
+     * Forces cache invalidation for a specific file path. Useful for testing
+     * cache behavior or forcing recompilation of a specific file.
+     *
+     * @param path - File path to invalidate cache for.
+     * @param transitive - Whether to invalidate transitive dependencies (default: false).
+     * @returns Confirmation status with the invalidated path.
+     * @example
+     * ```ts
+     * // Invalidate single file
+     * await bridge.invalidateCache('/path/to/file.pike', false);
+     *
+     * // Invalidate file and all its dependencies
+     * await bridge.invalidateCache('/path/to/file.pike', true);
+     * ```
+     */
+    async invalidateCache(path: string, transitive = false): Promise<import('./types.js').InvalidateCacheResult> {
+        return this.sendRequest<import('./types.js').InvalidateCacheResult>('invalidate_cache', {
+            path,
+            transitive: transitive ? 1 : 0,
+        });
     }
 }

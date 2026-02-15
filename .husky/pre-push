@@ -1,0 +1,59 @@
+#!/bin/bash
+# Pre-push hook: Validates build, Pike compilation, and all tests
+# Philosophy: "Green main, not green commits" - allow broken local commits
+# Output: Agent-friendly compact output via test-agent.sh (Carlini protocol)
+
+set -e  # Exit on error
+
+# Discover tools: check common locations if not already on PATH
+for dir in "$HOME/.bun/bin" /usr/local/bin; do
+  [ -d "$dir" ] && export PATH="$dir:$PATH"
+done
+
+# Auto-discover Pike if not on PATH
+if ! command -v pike >/dev/null 2>&1; then
+  for pike_dir in /usr/local/pike/*/bin "$HOME"/*/Pike-*/bin "$HOME"/OpenCode/Pike-*/bin; do
+    if [ -x "$pike_dir/pike" ]; then
+      export PATH="$pike_dir:$PATH"
+      break
+    fi
+  done
+  fi
+
+# 2. TypeScript build (compact output - only show errors)
+echo "[Pre-push] Running TypeScript build check..."
+BUILD_LOG=$(mktemp)
+if ! bun run build > "$BUILD_LOG" 2>&1; then
+  echo "FAILED: TypeScript build failed. Push aborted."
+  echo "--- Build errors ---"
+  grep -iP '(error|TS\d{4})' "$BUILD_LOG" | head -15
+  echo "---"
+  echo "Full log: $BUILD_LOG"
+  rm -f "$BUILD_LOG"
+  exit 1
+  fi
+
+# 3. Pike compile check (skip if SKIP_E2E=1)
+if [ "$SKIP_E2E" = "1" ]; then
+  echo "[Pre-push] SKIP_E2E=1, skipping Pike compile check..."
+  echo "Pike compile check SKIPPED"
+else
+  echo "[Pre-push] Running Pike compile check..."
+  pike -e 'compile_file("pike-scripts/analyzer.pike");' >/dev/null 2>&1
+  if [ $? -ne 0 ]; then
+    echo "FAILED: Pike compilation failed. Push aborted."
+    exit 1
+  fi
+  fi
+
+# 4. Secret detection (optional)
+if command -v gitleaks >/dev/null 2>&1; then
+  echo "[Pre-push] Scanning for secrets..."
+  GITLEAKS_LOG=$(mktemp)
+  if ! gitleaks detect --source . --log-opts="origin/main..HEAD" --redact > "$GITLEAKS_LOG" 2>&1; then
+    echo "FAILED: Gitleaks detected potential secrets."
+    cat "$GITLEAKS_LOG"
+    rm -f "$GITLEAKS_LOG"
+    exit 1
+  fi
+fi

@@ -2,10 +2,10 @@
     "files": [],
     "references": [
         {
-            "path": "./packages/pike-bridge"
+            "path": "./packages/core"
         },
         {
-            "path": "./packages/pike-analyzer"
+            "path": "./packages/pike-bridge"
         },
         {
             "path": "./packages/pike-lsp-server"

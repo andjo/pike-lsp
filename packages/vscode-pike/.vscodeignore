@@ -1,35 +1,44 @@
-# VSIX ignore file
-# Add files/directories here to exclude them from the VSIX package
-
-# Source files (we only need compiled dist)
-src/
+# Source files
+**/*.ts
+**/*.d.ts
+**/tsconfig.json
+**/tsconfig.*.json
 tsconfig.tsbuildinfo
 
-# Development files
-.vscode-test/
-.vscode/
-
-# Image source (SVG not needed, PNG is used)
-images/icon.svg
-
-# Tests
+# Test files
+**/test/**
 **/*.test.ts
-**/*.spec.ts
-test/
+**/*.test.js
+test-workspace/**
+.vscode-test/**
+.vscode-test.mjs
+test-output.log
 
-# NPM/PNPM lockfiles
-package-lock.json
-pnpm-lock.yaml
+# Development files
+node_modules/**
+scripts/**
+src/**
+.planning/**
+.omc/**
 
-# Git
-.git/
-.gitignore
+# Source maps
+**/*.map
 
-# CI/CD
-.github/
+# Documentation (exclude all except README)
+CHANGELOG.md
+CHANGELOG
+LICENSE
+LICENSE.md
+LICENSE.txt
+**/CLAUDE.md
 
-# Build scripts (not needed in VSIX)
-scripts/
+# Build artifacts not needed
+.git/**
+.eslintrc*
+.prettierrc*
+.npmignore
+package.json.files
 
-# Server source maps (optional, remove for smaller package)
-server/**/*.map
+# Parent directories
+../
+../../

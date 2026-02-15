@@ -1,23 +1,34 @@
 {
-    "name": "@pike-lsp/pike-bridge",
-    "version": "1.0.0",
-    "description": "TypeScript <-> Pike subprocess communication layer",
-    "type": "module",
-    "main": "./dist/index.js",
-    "types": "./dist/index.d.ts",
-    "scripts": {
-        "build": "tsc",
-        "clean": "rm -rf dist",
-        "watch": "tsc --watch",
-        "test": "pnpm build && node --test dist/bridge.test.js",
-        "typecheck": "tsc --noEmit"
+  "name": "@pike-lsp/pike-bridge",
+  "version": "0.1.0-alpha.19",
+  "description": "TypeScript <-> Pike subprocess communication layer",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TheSmuks/pike-lsp.git"
+  },
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
     },
-    "dependencies": {},
-    "devDependencies": {
-        "@types/node": "^20.10.0",
-        "typescript": "^5.3.0"
-    },
-    "engines": {
-        "node": ">=18.0.0"
-    }
+    "./dist/*": "./dist/*"
+  },
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "watch": "tsc --watch",
+    "test": "tsc && bun test dist/src/",
+    "test:corpus": "PIKE_CORPUS_TEST=1 bun test ./src/corpus.test.ts --timeout 1800000",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@pike-lsp/core": "workspace:^"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.0"
+  }
 }

@@ -1,0 +1,1284 @@
+//! Parser.pike - Stateless parser class for Pike LSP
+//!
+//! Design per CONTEXT.md:
+//! - Parser is a pure function: source text in, structured result out
+//! - Parser has no cache interaction (cache belongs to handler layer)
+//! - Parser methods throw exceptions on unexpected errors (caller catches)
+//!
+//! This file acts as a class - instantiate with Parser() from LSP.Parser
+
+// Constants (MAINT-004: Configuration constants)
+constant MAX_TOP_LEVEL_ITERATIONS = 10000;
+constant MAX_BLOCK_ITERATIONS = 500;
+
+//! Create a new Parser instance
+void create() {
+    // No state to initialize
+}
+
+//! Parse Pike source code and extract symbols
+//! @param params Mapping with "code", "filename", "line" keys
+//! @returns Mapping with "result" containing "symbols" and "diagnostics"
+//! @throws On unexpected parsing errors (caller catches)
+mapping parse_request(mapping params) {
+    string code = params->code || "";
+    string filename = params->filename || "input.pike";
+    int line = params->line || 1;
+
+    array symbols = ({});
+    array diagnostics = ({});
+
+    // Extract autodoc comments from original code before preprocessing
+    // Maps line number -> documentation string
+    // Use consolidated function from Intelligence.module
+    program IntelligenceModule = master()->resolv("LSP.Intelligence.module");
+    function extract_autodoc_comments = IntelligenceModule->extract_autodoc_comments;
+    mapping(int:string) autodoc_by_line = extract_autodoc_comments(code);
+
+    // STEP 1: Identify preprocessor conditional blocks for token-based extraction
+    // This happens BEFORE preprocessing to preserve branch structure
+    array(mapping) preprocessor_blocks = parse_preprocessor_blocks(code);
+
+    // STEP 2: Preprocess code: remove preprocessor directives that confuse PikeParser
+    // We need to track nesting to properly handle conditional blocks
+    // NOTE: This remains UNCHANGED for backward compatibility - base parse is identical
+    string preprocessed = "";
+    int preprocessed_line = 0;
+    int if_depth = 0;
+
+    foreach(code / "\n", string src_line) {
+        preprocessed_line++;
+        string trimmed = LSP.Compat.trim_whites(src_line);
+
+        // Handle conditional compilation - we can't evaluate these, so skip entire blocks
+        if (has_prefix(trimmed, "#if")) {
+            if_depth++;
+            preprocessed += "\n";
+        } else if (has_prefix(trimmed, "#else") || has_prefix(trimmed, "#elif")) {
+            preprocessed += "\n";
+        } else if (has_prefix(trimmed, "#endif")) {
+            if_depth--;
+            preprocessed += "\n";
+        } else if (if_depth > 0) {
+            preprocessed += "\n";
+        } else if (has_prefix(trimmed, "#include")) {
+            // Extract include path for navigation
+            string include_path = "";
+            string rest = trimmed[8..];
+            rest = LSP.Compat.trim_whites(rest);
+
+            if (sizeof(rest) > 1) {
+                if (rest[0] == '"') {
+                    int end = search(rest, "\"", 1);
+                    if (end > 0) include_path = rest[1..end-1];
+                } else if (rest[0] == '<') {
+                    int end = search(rest, ">", 1);
+                    if (end > 0) include_path = rest[1..end-1];
+                }
+            }
+
+            if (sizeof(include_path) > 0) {
+                symbols += ({
+                    ([
+                        "name": include_path,
+                        "kind": "include", // #include directives have kind='include' to distinguish from imports
+                        "modifiers": ({}),
+                        "position": ([
+                            "file": filename,
+                            "line": preprocessed_line
+                        ]),
+                        "classname": include_path // Use classname to store the path for the resolver
+                    ])
+                });
+            }
+            preprocessed += "\n";
+        } else if (has_prefix(trimmed, "#require")) {
+            // Extract require directive using limited subset parsing
+            string rest = trimmed[sizeof("#require")..];
+            rest = LSP.Compat.trim_whites(rest);
+
+            string require_path = "";
+            string resolution_type = "unknown";
+            int skip = 0;
+
+            // Pattern 1: String literal - #require "module.pike";
+            if (sizeof(rest) > 0 && rest[0] == '"') {
+                int end = search(rest, "\"", 1);
+                if (end > 0) {
+                    require_path = rest[1..end-1];
+                    resolution_type = "string_literal";
+                }
+            }
+            // Pattern 2: Constant identifier - #require constant(ModuleName);
+            else if (has_prefix(rest, "constant(")) {
+                string inner = rest[sizeof("constant(")..];
+                inner = LSP.Compat.trim_whites(inner);
+                int end = search(inner, ")");
+                if (end > 0) {
+                    require_path = inner[0..end-1];
+                    require_path = LSP.Compat.trim_whites(require_path);
+                    resolution_type = "constant_identifier";
+                }
+            }
+            // Pattern 3: Complex expression - mark as skip
+            else {
+                require_path = rest;
+                resolution_type = "complex_require";
+                skip = 1;
+            }
+
+            if (sizeof(require_path) > 0) {
+                symbols += ({
+                    ([
+                        "name": require_path,
+                        "kind": "require", // #require directives have kind='require'
+                        "modifiers": ([
+                            "resolution_type": resolution_type,
+                            "skip": skip
+                        ]),
+                        "position": ([
+                            "file": filename,
+                            "line": preprocessed_line
+                        ]),
+                        "classname": require_path // Use classname to store the path for the resolver
+                    ])
+                });
+            }
+            preprocessed += "\n";
+        } else if (has_prefix(trimmed, "#pike") ||
+                   has_prefix(trimmed, "#pragma") ||
+                   has_prefix(trimmed, "#define") ||
+                   has_prefix(trimmed, "#charset")) {
+            preprocessed += "\n";
+        } else {
+            preprocessed += src_line + "\n";
+        }
+    }
+
+    mixed err = catch {
+        object parser = Tools.AutoDoc.PikeParser(preprocessed, filename, line);
+        int iter = 0;
+        array(string) autodoc_buffer = ({});
+
+        while (parser->peekToken() != "" && iter++ < MAX_TOP_LEVEL_ITERATIONS) {
+            string current_token = parser->peekToken();
+
+            if (has_prefix(current_token, "//!")) {
+                string doc_text = current_token;
+                if (sizeof(doc_text) > 3) {
+                    doc_text = doc_text[3..];
+                    if (sizeof(doc_text) > 0 && doc_text[0] == ' ') {
+                        doc_text = doc_text[1..];
+                    }
+                } else {
+                    doc_text = "";
+                }
+                autodoc_buffer += ({doc_text});
+                parser->readToken();
+                continue;
+            }
+
+            mixed decl;
+            mixed parse_err = catch {
+                decl = parser->parseDecl();
+            };
+
+            if (parse_err) {
+                autodoc_buffer = ({});
+                parser->readToken();
+                continue;
+            }
+
+            if (decl) {
+                if (arrayp(decl)) {
+                    string documentation = sizeof(autodoc_buffer) > 0 ? autodoc_buffer * "\n" : "";
+                    autodoc_buffer = ({});
+
+                    foreach(decl, mixed d) {
+                        if (objectp(d)) {
+                            string doc = documentation;
+                            // Check autodoc_by_line - prefer it if it has autodoc markup tags
+                            if (d->position && d->position->firstline && autodoc_by_line[d->position->firstline]) {
+                                string line_doc = autodoc_by_line[d->position->firstline];
+                                // Prefer autodoc_by_line if empty doc, or if line_doc has markup
+                                program IntelligenceModule = master()->resolv("LSP.Intelligence.module");
+                                if (sizeof(doc) == 0 || (IntelligenceModule && IntelligenceModule->has_autodoc_markup(line_doc))) {
+                                    doc = line_doc;
+                                }
+                            }
+                            mixed convert_err = catch {
+                                symbols += ({symbol_to_json(d, doc)});
+                            };
+                        }
+                    }
+                } else if (objectp(decl)) {
+                    string decl_kind = get_symbol_kind(decl);
+
+                    if (decl_kind != "class" && decl_kind != "enum") {
+                        string documentation = sizeof(autodoc_buffer) > 0 ? autodoc_buffer * "\n" : "";
+                        autodoc_buffer = ({});
+
+                        // Check autodoc_by_line - prefer it if it has autodoc markup tags
+                        if (decl->position && decl->position->firstline && autodoc_by_line[decl->position->firstline]) {
+                            string line_doc = autodoc_by_line[decl->position->firstline];
+                            // Prefer autodoc_by_line if empty doc, or if line_doc has markup
+                            program IntelligenceModule = master()->resolv("LSP.Intelligence.module");
+                            if (sizeof(documentation) == 0 || (IntelligenceModule && IntelligenceModule->has_autodoc_markup(line_doc))) {
+                                documentation = line_doc;
+                            }
+                        }
+
+                        mixed convert_err = catch {
+                            symbols += ({symbol_to_json(decl, documentation)});
+                        };
+                    }
+                }
+            } else {
+                autodoc_buffer = ({});
+            }
+
+            parser->skipUntil((<";", "{", "">));
+            if (parser->peekToken() == "{") {
+                string decl_kind = "";
+                if (objectp(decl)) {
+                    decl_kind = get_symbol_kind(decl);
+                }
+
+                if (decl_kind == "class" || decl_kind == "enum") {
+                    string class_documentation = sizeof(autodoc_buffer) > 0 ? autodoc_buffer * "\n" : "";
+                    autodoc_buffer = ({});
+
+                    // Check autodoc_by_line - prefer it if it has autodoc markup tags
+                    if (decl->position && decl->position->firstline && autodoc_by_line[decl->position->firstline]) {
+                        string line_doc = autodoc_by_line[decl->position->firstline];
+                        // Prefer autodoc_by_line if empty doc, or if line_doc has markup
+                        program IntelligenceModule = master()->resolv("LSP.Intelligence.module");
+                        if (sizeof(class_documentation) == 0 || (IntelligenceModule && IntelligenceModule->has_autodoc_markup(line_doc))) {
+                            class_documentation = line_doc;
+                        }
+                    }
+
+                    parser->readToken();
+
+                    mixed class_decl = decl;
+
+                    // Parse class body using the reusable function
+                    array(mapping) class_children = parse_class_body(
+                        parser,
+                        autodoc_by_line,
+                        filename
+                    );
+
+                    // Consume closing brace if present
+                    if (parser->peekToken() == "}") {
+                        parser->readToken();
+                    }
+
+                    if (objectp(class_decl)) {
+                        mixed conv_err = catch {
+                            mapping class_json = symbol_to_json(class_decl, class_documentation);
+                            class_json["children"] = class_children;
+                            symbols += ({class_json});
+                        };
+                    }
+                } else if (decl_kind == "method" || decl_kind == "function") {
+                    parser->readToken();
+
+                    int body_iter = 0;
+                    int brace_depth = 1;
+
+                    while (brace_depth > 0 && parser->peekToken() != "" && body_iter++ < MAX_BLOCK_ITERATIONS) {
+                        string token = parser->peekToken();
+
+                        if (token == "}") {
+                            brace_depth--;
+                            parser->readToken();
+                            continue;
+                        }
+
+                        if (token == "{") {
+                            brace_depth++;
+                            parser->readToken();
+                            continue;
+                        }
+
+                        mixed local_decl;
+                        mixed parse_err = catch {
+                            local_decl = parser->parseDecl();
+                        };
+
+                        if (!parse_err && local_decl) {
+                            if (arrayp(local_decl)) {
+                                foreach(local_decl, mixed d) {
+                                    if (objectp(d)) {
+                                        string dkind = get_symbol_kind(d);
+                                        if (dkind == "variable" || dkind == "constant" || dkind == "typedef") {
+                                            symbols += ({symbol_to_json(d, "")});
+                                        }
+                                    }
+                                }
+                            } else if (objectp(local_decl)) {
+                                string dkind = get_symbol_kind(local_decl);
+                                if (dkind == "variable" || dkind == "constant" || dkind == "typedef") {
+                                    symbols += ({symbol_to_json(local_decl, "")});
+                                }
+                            }
+                            continue;
+                        } else {
+                            parser->skipUntil((<";", "{", "}", "">));
+                            if (parser->peekToken() == ";") {
+                                parser->readToken();
+                            }
+                        }
+                    }
+                } else {
+                    parser->skipBlock();
+                }
+            }
+            if (parser->peekToken() == ";") {
+                parser->readToken();
+            }
+        }
+    };
+
+    if (err) {
+        string error_msg = describe_error(err);
+        if (!has_value(error_msg, "expected identifier")) {
+            diagnostics += ({
+                ([
+                    "message": error_msg,
+                    "severity": "error",
+                    "position": ([
+                        "file": filename,
+                        "line": 1
+                    ])
+                ])
+            });
+        }
+    }
+
+    // STEP 3: Extract symbols from preprocessor conditional branches
+    // These are ADDITIVE to the base symbols - no existing symbols are modified
+    int total_branches = 0;
+    int MAX_BRANCHES = 16;  // Variant cap to prevent excessive extraction
+
+    foreach (preprocessor_blocks; int block_idx; mapping block) {
+        string block_condition = block->condition || "";
+
+        foreach (block->branches; int branch_idx; mapping branch) {
+            string branch_condition = branch->condition || "";
+            array(string) branch_lines = branch->lines || ({});
+            int branch_start = branch->start_line || 1;
+
+            // Skip branches with no code
+            if (sizeof(branch_lines) == 0) {
+                continue;
+            }
+
+            // Filter out preprocessor directive lines from branch code
+            // We only want the actual Pike code, not #if/#elif/#else/#endif
+            array(string) code_lines = ({});
+            foreach (branch_lines, string line) {
+                string trimmed = LSP.Compat.trim_whites(line);
+                // Skip preprocessor directives
+                if (!has_prefix(trimmed, "#if") &&
+                    !has_prefix(trimmed, "#elif") &&
+                    !has_prefix(trimmed, "#else") &&
+                    !has_prefix(trimmed, "#endif") &&
+                    !has_prefix(trimmed, "#ifdef") &&
+                    !has_prefix(trimmed, "#ifndef")) {
+                    code_lines += ({line});
+                }
+            }
+
+            // Reconstruct branch code for token-based extraction
+            string branch_code = code_lines * "\n";
+
+            // Skip if no code after filtering
+            if (sizeof(branch_code) == 0) {
+                continue;
+            }
+
+            // Enforce variant cap (check after we know branch has code)
+            if (total_branches >= MAX_BRANCHES) {
+                diagnostics += ({
+                    ([
+                        "message": sprintf("Preprocessor variant cap reached: only %d branches processed (add more if needed)", MAX_BRANCHES),
+                        "severity": "warning",
+                        "position": ([
+                            "file": filename,
+                            "line": branch_start
+                        ])
+                    ])
+                });
+                break;
+            }
+
+            // Extract symbols from this branch using token-based analysis
+            array(mapping) branch_symbols = extract_symbols_from_branch(
+                branch_code,
+                filename,
+                branch_start
+            );
+
+            // Mark each symbol as conditional and add branch metadata
+            foreach (branch_symbols; int i; mapping sym) {
+                sym["conditional"] = 1;
+                sym["condition"] = branch_condition;
+                sym["branch"] = branch_idx;
+
+                // Preserve position data from extraction
+                if (!sym["position"]) {
+                    sym["position"] = ([
+                        "file": filename,
+                        "line": branch_start
+                    ]);
+                }
+            }
+
+            // Append conditional symbols to result
+            symbols += branch_symbols;
+            total_branches++;
+        }
+
+        // Stop processing blocks if we hit the cap
+        if (total_branches >= MAX_BRANCHES) {
+            break;
+        }
+    }
+
+    return ([
+        "result": ([
+            "symbols": symbols,
+            "diagnostics": diagnostics
+        ])
+    ]);
+}
+
+//! Tokenize Pike source code
+//! @param params Mapping with "code" key
+//! @returns Mapping with "result" containing "tokens" array
+//! @throws On tokenization errors (caller catches)
+//! PERF-004: Includes character positions to avoid JavaScript string search
+mapping tokenize_request(mapping params) {
+    string code = params->code || "";
+    array tokens = ({});
+
+    // Access Parser.Pike via master()->resolv to avoid name conflict
+    program PikeParserModule = master()->resolv("Parser.Pike");
+    array(string) split_tokens = PikeParserModule->split(code);
+    array pike_tokens = PikeParserModule->tokenize(split_tokens);
+
+    // Build character position index for each line
+    array code_lines = code / "\n";
+    mapping(int:mapping(string:array(int))) line_positions = ([]);
+
+    for (int i = 0; i < sizeof(code_lines); i++) {
+        string line = code_lines[i];
+        if (!line || sizeof(line) == 0) continue;
+
+        mapping(string:array(int)) token_chars = ([]);
+
+        // Find all occurrences of each token in this line
+        foreach (pike_tokens, mixed t) {
+            if (t->line != i + 1) continue;
+
+            string token_text = t->text;
+            if (!token_chars[token_text]) {
+                token_chars[token_text] = ({});
+            }
+
+            // Find this token's position (nth occurrence)
+            int nth = sizeof(token_chars[token_text]);
+            int char_pos = -1;
+            int search_start = 0;
+
+            for (int j = 0; j <= nth; j++) {
+                int found = search(line[search_start..], token_text);
+                if (found == -1) break;
+                char_pos = search_start + found;
+                search_start = char_pos + sizeof(token_text);
+            }
+
+            if (char_pos >= 0) {
+                token_chars[token_text] += ({char_pos});
+            }
+        }
+
+        line_positions[i + 1] = token_chars;
+    }
+
+    // Build tokens with character positions
+    mapping(string:int) occurrence_index = ([]);
+
+    foreach (pike_tokens, mixed t) {
+        string key = sprintf("%d:%s", t->line, t->text);
+        int occ_idx = occurrence_index[key] || 0;
+        occurrence_index[key] = occ_idx + 1;
+
+        // Get pre-computed character position
+        int char_pos = -1;
+        if (line_positions[t->line] && line_positions[t->line][t->text]) {
+            array(int) positions = line_positions[t->line][t->text];
+            if (occ_idx < sizeof(positions)) {
+                char_pos = positions[occ_idx];
+            }
+        }
+
+        tokens += ({
+            ([
+                "text": t->text,
+                "line": t->line,
+                "character": char_pos,
+                "file": t->file
+            ])
+        });
+    }
+
+    return ([
+        "result": ([
+            "tokens": tokens
+        ])
+    ]);
+}
+
+//! Compile Pike source code and capture diagnostics
+//! @param params Mapping with "code" and "filename" keys
+//! @returns Mapping with "result" containing "symbols" and "diagnostics"
+//! @throws On compilation errors (caller catches)
+mapping compile_request(mapping params) {
+    string code = params->code || "";
+    string filename = params->filename || "input.pike";
+
+    array diagnostics = ({});
+
+    // Capture compilation errors using set_inhibit_compile_errors
+    void capture_error(string file, int line, string msg) {
+        diagnostics += ({
+            ([
+                "message": msg,
+                "severity": "error",
+                "position": ([
+                    "file": file,
+                    "line": line
+                ])
+            ])
+        });
+    };
+
+    // Save old handlers
+    mixed old_error = master()->get_inhibit_compile_errors();
+
+    // Set our capture handlers
+    master()->set_inhibit_compile_errors(capture_error);
+
+    // Try to compile
+    mixed err = catch {
+        compile_string(code, filename);
+    };
+
+    // Restore old handler
+    master()->set_inhibit_compile_errors(old_error);
+
+    return ([
+        "result": ([
+            "symbols": ({}),
+            "diagnostics": diagnostics
+        ])
+    ]);
+}
+
+//! Parse preprocessor conditional blocks and extract branch structure
+//! @param code Raw source code
+//! @returns Array of preprocessor block mappings with conditions, branches, line ranges
+protected array(mapping) parse_preprocessor_blocks(string code) {
+    array(mapping) blocks = ({});
+    array(mapping) stack = ({});
+
+    array(string) lines = code / "\n";
+
+    foreach (lines; int line_num; string raw_line) {
+        int line_index = line_num + 1;  // 1-based line numbers
+        string trimmed = LSP.Compat.trim_whites(raw_line);
+
+        // Detect preprocessor directives
+        if (has_prefix(trimmed, "#if") || has_prefix(trimmed, "#ifdef") || has_prefix(trimmed, "#ifndef")) {
+            // Start of a new conditional block
+            string condition = "";
+            if (has_prefix(trimmed, "#ifdef")) {
+                condition = LSP.Compat.trim_whites(trimmed[sizeof("#ifdef")..]);
+            } else if (has_prefix(trimmed, "#ifndef")) {
+                condition = LSP.Compat.trim_whites(trimmed[sizeof("#ifndef")..]);
+            } else {
+                condition = LSP.Compat.trim_whites(trimmed[sizeof("#if")..]);
+            }
+
+            mapping branch = ([
+                "condition": condition,
+                "startLine": line_index,
+                "endLine": line_index,
+                "lines": ({raw_line})
+            ]);
+
+            mapping block = ([
+                "condition": condition,
+                "branches": ({branch}),
+                "nesting_depth": sizeof(stack)
+            ]);
+
+            stack += ({block});
+        }
+        else if (has_prefix(trimmed, "#elif")) {
+            // New branch in current conditional block
+            if (sizeof(stack) > 0) {
+                string condition = LSP.Compat.trim_whites(trimmed[sizeof("#elif")..]);
+                mapping branch = ([
+                    "condition": condition,
+                    "startLine": line_index,
+                    "endLine": line_index,
+                    "lines": ({raw_line})
+                ]);
+
+                mapping current_block = stack[-1];
+                current_block["branches"] += ({branch});
+            }
+        }
+        else if (has_prefix(trimmed, "#else")) {
+            // Else branch in current conditional block
+            if (sizeof(stack) > 0) {
+                mapping branch = ([
+                    "condition": "else",
+                    "startLine": line_index,
+                    "endLine": line_index,
+                    "lines": ({raw_line})
+                ]);
+
+                mapping current_block = stack[-1];
+                current_block["branches"] += ({branch});
+            }
+        }
+        else if (has_prefix(trimmed, "#endif")) {
+            // End of current conditional block
+            if (sizeof(stack) > 0) {
+                mapping block = stack[-1];
+                stack = stack[0..sizeof(stack)-2];  // Pop from stack
+
+                // Update end line of the last branch
+                if (sizeof(block->branches) > 0) {
+                    mapping last_branch = block->branches[-1];
+                    last_branch->endLine = line_index;
+                }
+
+                blocks += ({block});
+            }
+        }
+        else {
+            // Regular line - add to current branch of all active blocks
+            foreach (stack; int i; mapping block) {
+                if (sizeof(block->branches) > 0) {
+                    mapping current_branch = block->branches[-1];
+                    current_branch->endLine = line_index;
+                    current_branch->lines += ({raw_line});
+                }
+            }
+        }
+    }
+
+    return blocks;
+}
+
+//! Extract symbol declarations from potentially incomplete code using token-based analysis
+//! Uses Parser.Pike.split() which handles unbalanced braces gracefully
+//! @param branch_code String of code from a single preprocessor branch
+//! @param filename Source filename for position tracking
+//! @param line_offset Line number offset for this branch within the file
+//! @returns Array of symbol mappings extracted from the branch
+protected array(mapping) extract_symbols_from_branch(string branch_code, string filename, int line_offset) {
+    array(mapping) symbols = ({});
+
+    // Token keywords for type detection
+    multiset(string) type_keywords = (<
+        "int", "string", "float", "mixed", "void", "array",
+        "mapping", "multiset", "object", "program", "function"
+    >);
+
+    // Modifier tokens
+    multiset(string) modifiers = (<
+        "static", "local", "private", "protected", "public", "final", "optional"
+    >);
+
+    mixed err = catch {
+        // Tokenize using Parser.Pike.split() - handles incomplete code gracefully
+        program PikeParserModule = master()->resolv("Parser.Pike");
+        array(string) tokens = PikeParserModule->split(branch_code);
+
+        // Walk tokens looking for declaration patterns
+        int i = 0;
+        while (i < sizeof(tokens)) {
+            string token = tokens[i];
+            string trimmed = String.trim_all_whites(token);
+
+            // Skip empty tokens and whitespace
+            if (sizeof(trimmed) == 0) {
+                i++;
+                continue;
+            }
+
+            // Pattern 1: class/enum declarations
+            if (trimmed == "class" || trimmed == "enum") {
+                // Next token should be the class/enum name
+                if (i + 1 < sizeof(tokens)) {
+                    string name_token = String.trim_all_whites(tokens[i + 1]);
+                    // Skip if it's a keyword (not a name)
+                    if (sizeof(name_token) > 0 && !type_keywords[name_token] && name_token != "{") {
+                        symbols += ({
+                            ([
+                                "name": name_token,
+                                "kind": trimmed,  // "class" or "enum"
+                                "position": ([
+                                    "file": filename,
+                                    "line": line_offset
+                                ])
+                            ])
+                        });
+                    }
+                }
+                i++;
+                continue;
+            }
+
+            // Pattern 2: modifier + type + name (e.g., "static int x")
+            if (modifiers[trimmed]) {
+                // Find next non-whitespace token - should be a type
+                int type_idx = i + 1;
+                while (type_idx < sizeof(tokens)) {
+                    string type_trimmed = String.trim_all_whites(tokens[type_idx]);
+                    if (sizeof(type_trimmed) > 0) {
+                        // Found next non-whitespace token
+                        if (type_keywords[type_trimmed]) {
+                            // Now find the name token (skip whitespace after type)
+                            int name_idx = type_idx + 1;
+                            while (name_idx < sizeof(tokens)) {
+                                string name_token = String.trim_all_whites(tokens[name_idx]);
+                                if (sizeof(name_token) > 0) {
+                                    // Found the name
+                                    // Skip if it's not an identifier
+                                    if (name_token != "{" &&
+                                        name_token != ";" &&
+                                        name_token != "(" &&
+                                        !type_keywords[name_token]) {
+                                        symbols += ({
+                                            ([
+                                                "name": name_token,
+                                                "kind": "variable",
+                                                "modifiers": ({trimmed}),
+                                                "position": ([
+                                                    "file": filename,
+                                                    "line": line_offset
+                                                ])
+                                            ])
+                                        });
+                                    }
+                                    break;
+                                }
+                                name_idx++;
+                            }
+                        }
+                        break;
+                    }
+                    type_idx++;
+                }
+                i++;
+                continue;
+            }
+
+            // Pattern 3: type + name (e.g., "int x" or "string foo()")
+            if (type_keywords[trimmed]) {
+                // Find next non-whitespace token - that should be the variable/function name
+                int next_idx = i + 1;
+                while (next_idx < sizeof(tokens)) {
+                    string next_trimmed = String.trim_all_whites(tokens[next_idx]);
+                    if (sizeof(next_trimmed) > 0) {
+                        // Found the next non-whitespace token
+
+                        // Skip if it's not an identifier (e.g., another keyword or operator)
+                        if (next_trimmed != "{" &&
+                            next_trimmed != ";" &&
+                            next_trimmed != "(" &&
+                            !type_keywords[next_trimmed] &&
+                            !modifiers[next_trimmed]) {
+
+                            // Check if this is a function (look for opening paren after name)
+                            string kind = "variable";
+                            int after_name_idx = next_idx + 1;
+                            while (after_name_idx < sizeof(tokens)) {
+                                string after_trimmed = String.trim_all_whites(tokens[after_name_idx]);
+                                if (sizeof(after_trimmed) > 0) {
+                                    if (after_trimmed == "(") {
+                                        kind = "method";
+                                    }
+                                    break;
+                                }
+                                after_name_idx++;
+                            }
+
+                            symbols += ({
+                                ([
+                                    "name": next_trimmed,
+                                    "kind": kind,
+                                    "position": ([
+                                        "file": filename,
+                                        "line": line_offset
+                                    ])
+                                ])
+                            });
+                        }
+                        break;
+                    }
+                    next_idx++;
+                }
+                i++;
+                continue;
+            }
+
+            i++;
+        }
+    };
+
+    // Log errors but don't fail - token extraction is best-effort
+    if (err) {
+        werror("extract_symbols_from_branch: %O\n", describe_error(err));
+    }
+
+    return symbols;
+}
+
+//! Parse preprocessor blocks - public wrapper
+//! @param params Mapping with "code" key
+//! @returns Mapping with "result" containing "blocks" array
+//! @throws On parsing errors (caller catches)
+mapping parse_preprocessor_blocks_request(mapping params) {
+    string code = params->code || "";
+    array blocks = parse_preprocessor_blocks(code);
+
+    return ([
+        "result": ([
+            "blocks": blocks
+        ])
+    ]);
+}
+
+//! Parse multiple Pike source files in a single request
+//! @param params Mapping with "files" array (each with "code" and "filename")
+//! @returns Mapping with "result" containing "results" array and "count"
+//! @throws On batch processing errors (caller catches)
+mapping batch_parse_request(mapping params) {
+    array files = params->files || ({});
+    array results = ({});
+
+    foreach (files, mapping file_info) {
+        string code = file_info->code || "";
+        string filename = file_info->filename || "unknown.pike";
+
+        // Try to parse each file, continuing even if one fails
+        mixed parse_err;
+        mapping parse_result;
+
+        parse_err = catch {
+            parse_result = parse_request(([
+                "code": code,
+                "filename": filename,
+                "line": 1
+            ]));
+        };
+
+        if (parse_err) {
+            // On error, return result with error diagnostic
+            results += ({
+                ([
+                    "filename": filename,
+                    "symbols": ({}),
+                    "diagnostics": ({
+                        ([
+                            "severity": "error",
+                            "message": "Parse error: " + describe_error(parse_err),
+                            "position": ([
+                                "file": filename,
+                                "line": 1
+                            ])
+                        ])
+                    })
+                ])
+            });
+        } else {
+            // Extract results from parse response
+            mapping parse_data = parse_result->result || ([]);
+            results += ({
+                ([
+                    "filename": filename,
+                    "symbols": parse_data->symbols || ({}),
+                    "diagnostics": parse_data->diagnostics || ({})
+                ])
+            });
+        }
+    }
+
+    return ([
+        "result": ([
+            "results": results,
+            "count": sizeof(results)
+        ])
+    ]);
+}
+
+protected string get_symbol_kind(object symbol) {
+    string repr = sprintf("%O", symbol);
+
+    if (has_value(repr, "->Class(")) return "class";
+    if (has_value(repr, "->Method(")) return "method";
+    if (has_value(repr, "->Variable(")) return "variable";
+    if (has_value(repr, "->Constant(")) return "constant";
+    if (has_value(repr, "->Typedef(")) return "typedef";
+    if (has_value(repr, "->Enum(") && !has_value(repr, "->EnumConstant(")) return "enum";
+    if (has_value(repr, "->EnumConstant(")) return "enum_constant";
+    if (has_value(repr, "->Inherit(")) return "inherit";
+    if (has_value(repr, "->Import(")) return "import";
+    if (has_value(repr, "->Modifier(")) return "modifier";
+    if (has_value(repr, "->Module(")) return "module";
+    if (has_value(repr, "->NameSpace(")) return "namespace";
+
+    if (catch {return symbol->returntype ? "method" : 0;} == 0) return "method";
+    if (catch {return symbol->type ? "variable" : 0;} == 0) return "variable";
+
+    return "unknown";
+}
+
+//! Parse autodoc documentation string into structured format
+//! Extracts @param, @returns, @throws, @note, @seealso, @deprecated tags
+//! @param doc Raw autodoc string (with //! prefixes stripped)
+//! @returns Mapping with text, params, returns, throws, notes, seealso, deprecated
+//! @deprecated Use TypeAnalysis.parse_autodoc() instead. This function delegates to
+//!             TypeAnalysis which provides superior parsing with inline markup,
+//!             structured types, and native Pike parser integration.
+protected mapping simple_parse_autodoc(string doc) {
+    if (!doc || sizeof(doc) == 0) return ([]);
+
+    // Delegate to TypeAnalysis.parse_autodoc() for superior parsing
+    program type_analysis_program = master()->resolv("LSP.Intelligence.TypeAnalysis");
+    if (type_analysis_program) {
+        mixed err = catch {
+            object type_analyzer = type_analysis_program(0);
+            return type_analyzer->parse_autodoc(doc);
+        };
+
+        // Log error but continue to minimal fallback
+        if (err) {
+            // Fallback: return basic text only
+            return ([ "text": doc ]);
+        }
+    }
+
+    // Absolute fallback if TypeAnalysis unavailable (should not happen in normal operation)
+    return ([ "text": doc ]);
+}
+
+//! Parse a class or enum body and return child symbols
+//! @param parser The PikeParser positioned after the opening {
+//! @param autodoc_by_line Mapping of line->autodoc documentation
+//! @param filename Source filename for position tracking
+//! @param max_depth Maximum recursion depth (default 5)
+//! @param current_depth Current depth (default 0)
+//! @returns Array of child symbol mappings
+protected array(mapping) parse_class_body(
+    object parser,
+    mapping autodoc_by_line,
+    string filename,
+    int|void max_depth,
+    int|void current_depth
+) {
+    // Set defaults
+    if (!max_depth) max_depth = 5;
+    if (!current_depth) current_depth = 0;
+
+    // Guard against excessive recursion
+    if (current_depth >= max_depth) {
+        return ({});
+    }
+
+    array(mapping) class_children = ({});
+    array(string) member_autodoc_buffer = ({});
+    int block_iter = 0;
+
+    while (parser->peekToken() != "}" && parser->peekToken() != "" && block_iter++ < MAX_BLOCK_ITERATIONS) {
+        string member_token = parser->peekToken();
+
+        if (has_prefix(member_token, "//!")) {
+            string doc_text = member_token;
+            if (sizeof(doc_text) > 3) {
+                doc_text = doc_text[3..];
+                if (sizeof(doc_text) > 0 && doc_text[0] == ' ') {
+                    doc_text = doc_text[1..];
+                }
+            } else {
+                doc_text = "";
+            }
+            member_autodoc_buffer += ({doc_text});
+            parser->readToken();
+            continue;
+        }
+
+        mixed member_decl;
+        mixed member_err = catch {
+            member_decl = parser->parseDecl();
+        };
+
+        if (member_err) {
+            member_autodoc_buffer = ({});
+            parser->readToken();
+            continue;
+        }
+
+        if (member_decl) {
+            string member_doc = sizeof(member_autodoc_buffer) > 0 ? member_autodoc_buffer * "\n" : "";
+            member_autodoc_buffer = ({});
+
+            if (arrayp(member_decl)) {
+                foreach(member_decl, mixed m) {
+                    if (objectp(m)) {
+                        string doc = member_doc;
+                        // Check autodoc_by_line - prefer it if it has autodoc markup tags
+                        if (m->position && m->position->firstline && autodoc_by_line[m->position->firstline]) {
+                            string line_doc = autodoc_by_line[m->position->firstline];
+                            // Prefer autodoc_by_line if empty doc, or if line_doc has markup
+                            program IntelligenceModule = master()->resolv("LSP.Intelligence.module");
+                            if (sizeof(doc) == 0 || (IntelligenceModule && IntelligenceModule->has_autodoc_markup(line_doc))) {
+                                doc = line_doc;
+                            }
+                        }
+                        mixed conv_err = catch {
+                            class_children += ({symbol_to_json(m, doc)});
+                        };
+                    }
+                }
+            } else if (objectp(member_decl)) {
+                string doc = member_doc;
+                // Check autodoc_by_line - prefer it if it has autodoc markup tags
+                if (member_decl->position && member_decl->position->firstline && autodoc_by_line[member_decl->position->firstline]) {
+                    string line_doc = autodoc_by_line[member_decl->position->firstline];
+                    // Prefer autodoc_by_line if empty doc, or if line_doc has markup
+                    program IntelligenceModule = master()->resolv("LSP.Intelligence.module");
+                    if (sizeof(doc) == 0 || (IntelligenceModule && IntelligenceModule->has_autodoc_markup(line_doc))) {
+                        doc = line_doc;
+                    }
+                }
+                mixed conv_err = catch {
+                    class_children += ({symbol_to_json(member_decl, doc)});
+                };
+            }
+        } else {
+            member_autodoc_buffer = ({});
+        }
+
+        parser->skipUntil((<";", "{", "}", "">));
+        if (parser->peekToken() == "{") {
+            // Check if this is a nested class/enum
+            string member_kind = "";
+            if (objectp(member_decl)) {
+                member_kind = get_symbol_kind(member_decl);
+            }
+
+            if (member_kind == "class" || member_kind == "enum") {
+                // Recursively parse nested class body
+                parser->readToken();  // Consume opening brace
+                array(mapping) nested_children = parse_class_body(
+                    parser,
+                    autodoc_by_line,
+                    filename,
+                    max_depth,
+                    current_depth + 1
+                );
+
+                // Attach nested children to the last class member
+                if (sizeof(class_children) > 0 && sizeof(nested_children) > 0) {
+                    class_children[-1]["children"] = nested_children;
+                }
+
+                // Consume closing brace if present
+                if (parser->peekToken() == "}") {
+                    parser->readToken();
+                }
+            } else {
+                // Not a nested class - skip the block
+                parser->skipBlock();
+            }
+        }
+        if (parser->peekToken() == ";") {
+            parser->readToken();
+        }
+    }
+
+    return class_children;
+}
+
+protected mapping symbol_to_json(object symbol, string|void documentation) {
+    string kind = get_symbol_kind(symbol);
+
+    mapping result = ([
+        "name": symbol->name,
+        "kind": kind,
+        "modifiers": symbol->modifiers || ([]),
+    ]);
+
+    if (documentation && sizeof(documentation) > 0) {
+        // Use TypeAnalysis.parse_autodoc() for superior parsing
+        // (supports inline markup, structured types, paramOrder, @ignore/@endignore)
+        program type_analysis_program = master()->resolv("LSP.Intelligence.TypeAnalysis");
+        if (type_analysis_program) {
+            object type_analyzer = type_analysis_program(0);
+            result->documentation = type_analyzer->parse_autodoc(documentation);
+        } else {
+            // Fallback to simple parser if TypeAnalysis not available
+            result->documentation = simple_parse_autodoc(documentation);
+        }
+    }
+
+    catch {
+        if (symbol->position) {
+            result->position = ([
+                "file": symbol->position->filename || "",
+                "line": symbol->position->firstline || 1
+            ]);
+        }
+    };
+
+    if (kind == "method") {
+        catch {
+            if (symbol->returntype) {
+                result->returnType = type_to_json(symbol->returntype);
+            }
+        };
+        catch {
+            if (symbol->argnames) result->argNames = symbol->argnames;
+        };
+        catch {
+            if (symbol->argtypes) result->argTypes = map(symbol->argtypes, type_to_json);
+        };
+    } else if (kind == "variable" || kind == "constant" || kind == "typedef") {
+        catch {
+            if (symbol->type) result->type = type_to_json(symbol->type);
+        };
+    } else if (kind == "class") {
+        // Could add inherits, children later
+    } else if (kind == "inherit" || kind == "import") {
+        // RESEARCH NOTE (Feb 2026): Inherit statement handling is fully implemented
+        //
+        // Parser behavior:
+        // - parseDecl() returns Tools.AutoDoc.PikeParser()->Inherit() for inherit statements
+        // - Inherit objects have: name (local alias), classname (full path), position
+        // - get_symbol_kind() line 573 returns "inherit" for these objects
+        // - Main parsing loop (lines 182-239) automatically processes inherits as class members
+        //
+        // Test results show correct extraction:
+        // - "inherit Y;" → {kind:"inherit", name:"Y", classname:"Y"}
+        // - "inherit Z : z_alias;" → {kind:"inherit", name:"z_alias", classname:"Z"}
+        // - "inherit A.B.C;" → {kind:"inherit", name:"C", classname:"A.B.C"}
+        //
+        // No Pike-side changes needed - focus TypeScript efforts on navigation/resolution.
+        catch {
+            if (symbol->classname) {
+                string c = symbol->classname;
+                if (sizeof(c) >= 2 && c[0] == '"' && c[-1] == '"') c = c[1..sizeof(c)-2];
+                if (sizeof(c) >= 2 && c[0] == '\'' && c[-1] == '\'') c = c[1..sizeof(c)-2];
+                result->classname = c;
+            }
+        };
+        catch {
+            if (symbol->name) {
+                string n = symbol->name;
+                if (sizeof(n) >= 2 && n[0] == '"' && n[-1] == '"') n = n[1..sizeof(n)-2];
+                if (sizeof(n) >= 2 && n[0] == '\'' && n[-1] == '\'') n = n[1..sizeof(n)-2];
+                result->name = n;
+            }
+        };
+    }
+
+    return result;
+}
+
+protected mapping|int type_to_json(object|void type) {
+    if (!type) return 0;
+
+    mapping result = ([]);
+
+    catch {
+        if (type->name) result->name = type->name;
+    };
+
+    // Check what type class this is
+    string class_path = "";
+    catch {class_path = Program.defined(object_program(type)) || "";};
+
+    if (!result->name) {
+        if (has_value(class_path, "IntType")) result->name = "int";
+        else if (has_value(class_path, "StringType")) result->name = "string";
+        else if (has_value(class_path, "FloatType")) result->name = "float";
+        else if (has_value(class_path, "ArrayType")) result->name = "array";
+        else if (has_value(class_path, "MappingType")) result->name = "mapping";
+        else if (has_value(class_path, "MultisetType")) result->name = "multiset";
+        else if (has_value(class_path, "FunctionType")) result->name = "function";
+        else if (has_value(class_path, "ObjectType")) result->name = "object";
+        else if (has_value(class_path, "ProgramType")) result->name = "program";
+        else if (has_value(class_path, "MixedType")) result->name = "mixed";
+        else if (has_value(class_path, "VoidType")) result->name = "void";
+        else if (has_value(class_path, "ZeroType")) result->name = "zero";
+        else if (has_value(class_path, "OrType")) result->name = "or";
+        else if (has_value(class_path, "VarargsType")) result->name = "varargs";
+        else if (has_value(class_path, "AttributeType")) {
+            result->name = "__attribute__";
+            catch {
+                if (type->attribute) result->attribute = type->attribute;
+            };
+            catch {
+                if (type->subtype) return type_to_json(type->subtype);
+                if (type->type) return type_to_json(type->type);
+            };
+        } else result->name = "unknown";
+    }
+
+    if (result->name == "__attribute__") {
+        catch {
+            if (type->type_or_type) return type_to_json(type->type_or_type);
+            if (type->subtype) return type_to_json(type->subtype);
+        };
+    }
+
+    // Handle OrType: extract constituent types
+    if (result->name == "or" || has_value(class_path, "OrType")) {
+        result->name = "or";
+        catch {
+            if (type->types && sizeof(type->types) > 0) {
+                result->types = map(type->types, type_to_json);
+            }
+        };
+    }
+
+    // Handle ObjectType: include classname (e.g., "this_program", "Gmp.mpz")
+    if (result->name == "object" || has_value(class_path, "ObjectType")) {
+        catch {
+            if (type->classname && sizeof(type->classname) > 0) {
+                result->className = type->classname;
+            }
+        };
+    }
+
+    // Handle ProgramType: include classname
+    if (result->name == "program" || has_value(class_path, "ProgramType")) {
+        catch {
+            if (type->classname && sizeof(type->classname) > 0) {
+                result->className = type->classname;
+            }
+        };
+    }
+
+    return sizeof(result) > 0 ? result : 0;
+}

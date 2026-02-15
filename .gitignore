@@ -1,8 +1,16 @@
 # Dependencies
 node_modules/
 
+# Package manager lockfiles
+bun.lockb
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
 # Build outputs
 dist/
+out/
+build/
 *.tsbuildinfo
 
 # IDE and editor files
@@ -29,6 +37,8 @@ credentials.json
 *.log
 npm-debug.log*
 pnpm-debug.log*
+bun-debug.log*
+!.claude/status/*.log
 
 # Test artifacts
 coverage/
@@ -48,3 +58,43 @@ repomix-output.*
 tmp/
 temp/
 *.tmp
+
+# VS Code Test
+.vscode-test/
+packages/vscode-pike/.vscode-test/
+
+# Husky shell script cache
+.husky/_
+benchmark-results-mitata.json
+benchmark-results.json
+benchmark-output.txt
+
+# Pike test/development scripts
+pike-scripts/test_*.pike
+pike-scripts/verify_*.pike
+
+# Build artifacts
+packages/vscode-pike/package.json.files
+# Local analysis reports - do not commit
+AUTODOC_COVERAGE_ANALYSIS.md
+CODEBASE_REVIEW_REPORT.md
+QA_TEST_REPORT_PHASE5.md
+pike-scripts/IMPORT_TRACKING_IMPLEMENTATION.md
+# OMC agent cache
+.omc/
+
+# Dev-only directories
+.planning/
+.agent/
+
+# Agent config (local overrides)
+agent.config.local
+
+# Accidental files - should never be committed
+*.kate-swp
+Screenshot*.png
+WhatsApp*.jpeg
+t_v7.txt
+
+# Large binaries - install via package manager
+scripts/act

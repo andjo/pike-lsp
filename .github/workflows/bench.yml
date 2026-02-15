@@ -1,0 +1,69 @@
+name: Performance Benchmarks
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Install Pike
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pike8.0-full
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build packages
+        run: bun run build
+
+      - name: Run benchmarks
+        run: bash scripts/benchmark-ci.sh
+        timeout-minutes: 10
+
+      - name: Check benchmark regression (cache metrics)
+        run: |
+          node scripts/check-benchmark-regression.js benchmark-results.json
+        env:
+          CACHE_HIT_THRESHOLD: 80  # Expect >80% hit rate for repeated requests
+          COMPILE_SPEEDUP_THRESHOLD: 50  # Expect >50% speedup for cache hits
+
+      - name: Fetch gh-pages for historical data
+        run: git fetch origin gh-pages:gh-pages || true
+
+      - name: Check performance regression (rolling average)
+        run: node scripts/apply-rolling-average.js 5
+        env:
+          BENCHMARK_RESULTS: benchmark-results.json
+
+      - name: Prepare for benchmark storage
+        run: |
+          # Stash benchmark results so git switch doesn't fail
+          cp benchmark-results.json /tmp/benchmark-results.json
+          git stash --include-untracked || true
+
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Pike LSP Performance
+          tool: 'customSmallerIsBetter'
+          output-file-path: /tmp/benchmark-results.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: '150%'
+          comment-on-alert: true
+          fail-on-alert: false  # Rolling average analysis handles regression detection
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: benchmarks

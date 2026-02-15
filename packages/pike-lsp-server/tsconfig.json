@@ -3,21 +3,28 @@
     "compilerOptions": {
         "outDir": "./dist",
         "rootDir": "./src",
-        "noImplicitAny": false
+        "noImplicitAny": false,
+        "composite": true,
+        "paths": {
+            "@pike-lsp/core": ["../core/src"],
+            "@pike-lsp/pike-bridge": ["../pike-bridge/src"],
+            "@pike-lsp/pike-bridge/dist/*": ["../pike-bridge/dist/*"]
+        }
     },
     "include": [
         "src/**/*"
     ],
     "exclude": [
         "node_modules",
-        "dist"
+        "dist",
+        "src/tests/**/*.test.ts"
     ],
     "references": [
         {
-            "path": "../pike-bridge"
+            "path": "../core"
         },
         {
-            "path": "../pike-analyzer"
+            "path": "../pike-bridge"
         }
     ]
 }
