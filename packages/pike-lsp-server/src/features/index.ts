@@ -9,7 +9,10 @@
 export { registerSymbolsHandlers } from './symbols.js';
 
 // Diagnostics feature - validation and document lifecycle
-export { registerDiagnosticsHandlers } from './diagnostics.js';
+export { registerDiagnosticsHandlers } from './diagnostics/index.js';
+export { convertDiagnostic, isDeprecatedSymbolDiagnostic, extractDeprecatedFromSymbols } from './diagnostics/index.js';
+export { buildSymbolPositionIndex, buildSymbolPositionIndexRegex, flattenSymbols } from './diagnostics/index.js';
+export { classifyChange, stripLineComments, type ChangeClassification } from './diagnostics/index.js';
 
 // Navigation feature - go to definition, references, etc.
 export { registerNavigationHandlers } from './navigation/index.js';
@@ -29,6 +32,9 @@ export type { RoxenModuleInfo, RXMLTag, ModuleVariable } from './roxen/types.js'
 
 // RXML feature - RXML template support (Phase 2)
 export { registerRXMLHandlers } from './rxml/index.js';
+
+// File watcher feature - incremental updates for file changes (Issue #184)
+export { registerFileWatcher, getPikeFileWatchPatterns } from './file-watcher.js';
 export {
   provideRXMLCompletions,
   parseRXMLTemplate,
