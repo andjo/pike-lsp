@@ -94,8 +94,18 @@ class module {
     //! Called when the module is loaded
     void create() {}
 
-    //! Register a configuration variable (simplified stub)
-    void defvar(string name, mixed default_val, int type, string|void doc) {}
+    //! Register a configuration variable (simplified stub).
+    //! Signature aligned with Roxen BasicDefvar compatibility form.
+    void defvar(
+        string var,
+        mixed value,
+        mixed|void name,
+        int|void type,
+        mixed|void doc_str,
+        mixed|void misc,
+        int|function|void not_in_config,
+        mapping|void option_translations
+    ) {}
 }
 
 //! Common Roxen type constants (matching Roxen 6.1 module.h)

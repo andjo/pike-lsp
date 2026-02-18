@@ -27,6 +27,15 @@ All settings are optional. Add any you need to your VS Code `settings.json`:
 }
 ```
 
+`pike.pikeProgramPath` is optional and only needed for advanced overrides.
+When unset, the extension automatically uses bundled Roxen stubs for program resolution.
+
+```json
+{
+  "pike.pikeProgramPath": ["/path/to/custom/pike/programs"]
+}
+```
+
 ## Using the Extension
 1. Open a `.pike` or `.pmod` file.
 2. The Pike Language Server starts automatically.

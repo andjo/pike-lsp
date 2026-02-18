@@ -4,6 +4,13 @@
 //! to enable LSP analysis of Pike code that uses Roxen APIs without
 //! requiring the actual Roxen runtime environment.
 
+//! Make Roxen constants/classes available in inherit scope.
+//! This exposes MODULE_*, TYPE_*, VAR_* and RequestID.
+inherit "Roxen";
+
+//! Provide base module behavior such as defvar().
+inherit module;
+
 //! Export the main Roxen stub class
 constant Roxen = Roxen;
 

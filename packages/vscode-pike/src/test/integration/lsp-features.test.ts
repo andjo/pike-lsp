@@ -91,6 +91,21 @@ suite('LSP Feature E2E Tests', () => {
             console.log('Extension activated for LSP feature tests');
         }
 
+        // Configure program path so inherit "module" resolves via bundled Roxen stubs.
+        const roxenStubsPath = path.join(
+            extension.extensionPath,
+            'server',
+            'pike-scripts',
+            'LSP.pmod',
+            'RoxenStubs.pmod'
+        );
+        await vscode.workspace.getConfiguration('pike').update(
+            'pikeProgramPath',
+            [roxenStubsPath],
+            vscode.ConfigurationTarget.Workspace
+        );
+        logServerOutput(`Configured pikeProgramPath: ${roxenStubsPath}`);
+
         // Set up output channel monitoring for Pike server logs
         // The LSP client sends Pike output to the "Pike Language Server" output channel
         try {
@@ -2108,6 +2123,16 @@ suite('Waterfall Loading E2E Tests', () => {
         // Allow up to 5 warnings (not errors) - the module should still be functional
         const errorCount = diagnostics.filter(d => d.severity === vscode.DiagnosticSeverity.Error).length;
         const warningCount = diagnostics.filter(d => d.severity === vscode.DiagnosticSeverity.Warning).length;
+
+        const moduleResolutionErrors = diagnostics.filter(d =>
+            /Cast "module" to program failed|Illegal program pointer|Error finding program/.test(d.message)
+        );
+        assert.strictEqual(
+            moduleResolutionErrors.length,
+            0,
+            `Roxen module should resolve inherit \"module\" without cast/program errors: ${moduleResolutionErrors.map(d => d.message).join('; ')}`
+        );
+
         assert.ok(errorCount <= 3 && warningCount <= 5, `Roxen module diagnostics: ${errorCount} errors, ${warningCount} warnings`);
     });
 

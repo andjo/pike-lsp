@@ -232,6 +232,7 @@ async function activateInternal(context: ExtensionContext, testOutputChannel?: O
             if (
                 event.affectsConfiguration('pike.pikeModulePath') ||
                 event.affectsConfiguration('pike.pikeIncludePath') ||
+                event.affectsConfiguration('pike.pikeProgramPath') ||
                 event.affectsConfiguration('pike.pikePath')
             ) {
                 await restartClient(false);
@@ -305,6 +306,24 @@ function getExpandedIncludePaths(): string[] {
     return expandedPaths;
 }
 
+function getExpandedProgramPaths(): string[] {
+    const config = workspace.getConfiguration('pike');
+    const pikeProgramPath = config.get<string[]>('pikeProgramPath', []);
+    let expandedPaths: string[] = [];
+
+    if (workspace.workspaceFolders && workspace.workspaceFolders.length > 0) {
+        const f = workspace.workspaceFolders[0]!.uri.fsPath;
+        for (const p of pikeProgramPath) {
+            expandedPaths.push(p.replace("${workspaceFolder}", f));
+        }
+    } else {
+        expandedPaths = pikeProgramPath;
+    }
+
+    outputChannel.appendLine(`Pike program path: ${JSON.stringify(pikeProgramPath)}`);
+    return expandedPaths;
+}
+
 async function restartClient(showMessage: boolean): Promise<void> {
     if (!serverOptions) {
         return;
@@ -322,6 +341,7 @@ async function restartClient(showMessage: boolean): Promise<void> {
     const pikePath = config.get<string>('pikePath', 'pike');
     const expandedPaths = getExpandedModulePaths();
     const expandedIncludePaths = getExpandedIncludePaths();
+    const configuredProgramPaths = getExpandedProgramPaths();
 
     // Windows uses semicolon as PATH separator, Unix uses colon
     // Pike on Windows also expects forward slashes, not backslashes
@@ -340,6 +360,13 @@ async function restartClient(showMessage: boolean): Promise<void> {
     const serverDir = path.dirname(serverModulePath);
     const extensionRoot = path.resolve(serverDir, '..');
     const analyzerPath = path.join(extensionRoot, 'server', 'pike-scripts', 'analyzer.pike');
+    const bundledRoxenStubsPath = path.join(extensionRoot, 'server', 'pike-scripts', 'LSP.pmod', 'RoxenStubs.pmod');
+
+    // Default to bundled Roxen stubs so inherit "module" resolves without extra setup.
+    const expandedProgramPaths = configuredProgramPaths.length > 0
+        ? configuredProgramPaths
+        : (fs.existsSync(bundledRoxenStubsPath) ? [bundledRoxenStubsPath] : []);
+    const normalizedProgramPaths = expandedProgramPaths.map(normalizePath);
 
     const clientOptions: LanguageClientOptions = {
         documentSelector: [
@@ -354,6 +381,7 @@ async function restartClient(showMessage: boolean): Promise<void> {
             env: {
                 'PIKE_MODULE_PATH': normalizedModulePaths.join(pathSeparator),
                 'PIKE_INCLUDE_PATH': normalizedIncludePaths.join(pathSeparator),
+                'PIKE_PROGRAM_PATH': normalizedProgramPaths.join(pathSeparator),
             },
         },
         outputChannel,

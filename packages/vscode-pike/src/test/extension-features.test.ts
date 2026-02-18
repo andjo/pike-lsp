@@ -223,7 +223,21 @@ describe('Phase 7: VSCode Extension Features (Categories 31-34)', () => {
             expect(includePathConfig?.default.length).toBe(0);
         });
 
-        test('34.4 should support pike.trace.server configuration', async () => {
+        test('34.4 should support pike.pikeProgramPath configuration', async () => {
+            // Read package.json to verify configuration schema
+            const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
+            const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
+
+            // Verify pike.pikeProgramPath configuration exists
+            const programPathConfig = packageJson.contributes?.configuration?.properties?.['pike.pikeProgramPath'];
+            expect(programPathConfig).toBeDefined();
+            expect(programPathConfig?.type).toBe('array');
+            expect(programPathConfig?.items).toBeDefined();
+            expect(programPathConfig?.items.type).toBe('string');
+            expect(programPathConfig?.default.length).toBe(0);
+        });
+
+        test('34.5 should support pike.trace.server configuration', async () => {
             // Read package.json to verify configuration schema
             const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
             const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
@@ -239,7 +253,7 @@ describe('Phase 7: VSCode Extension Features (Categories 31-34)', () => {
             expect(traceConfig?.default).toBe('off');
         });
 
-        test('34.5 should support pike.diagnosticDelay configuration', async () => {
+        test('34.6 should support pike.diagnosticDelay configuration', async () => {
             // Read package.json to verify configuration schema
             const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
             const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
@@ -257,11 +271,11 @@ describe('Phase 7: VSCode Extension Features (Categories 31-34)', () => {
     /**
      * Summary: Test Statistics for Categories 31-34
      *
-     * Total tests in this file: 16
+     * Total tests in this file: 17
      * - Category 31: 2 tests
      * - Category 32: 5 tests
      * - Category 33: 4 tests
-     * - Category 34: 5 tests
+     * - Category 34: 6 tests
      */
     describe('Summary', () => {
         test('should report total test count', () => {
@@ -269,9 +283,9 @@ describe('Phase 7: VSCode Extension Features (Categories 31-34)', () => {
             console.log('Category 31 (Language Registration): 2 tests');
             console.log('Category 32 (Syntax Highlighting): 5 tests');
             console.log('Category 33 (Commands): 4 tests');
-            console.log('Category 34 (Configuration): 5 tests');
+            console.log('Category 34 (Configuration): 6 tests');
             console.log('=============================');
-            console.log('TOTAL: 16 tests (converted to bun:test)');
+            console.log('TOTAL: 17 tests (converted to bun:test)');
             console.log('=============================');
             expect(true).toBe(true);
         });
