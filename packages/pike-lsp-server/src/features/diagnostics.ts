@@ -25,6 +25,7 @@ import { Logger } from '@pike-lsp/core';
 import { DIAGNOSTIC_DELAY_DEFAULT, DEFAULT_MAX_PROBLEMS } from '../constants/index.js';
 import { computeContentHash, computeLineHashes } from '../services/document-cache.js';
 import { detectRoxenModule, provideRoxenDiagnostics } from '../features/roxen/index.js';
+import { buildSymbolNameIndex } from './diagnostics/symbol-index.js';
 
 /**
  * Extract deprecated status from parsed symbols recursively.
@@ -139,13 +140,26 @@ export function convertDiagnostic(
     if (options?.code) {
         diagnostic.code = options.code;
     } else {
-        // Infer code from message
-        if (pikeDiag.message.includes('uninitialized') || pikeDiag.message.includes('used before')) {
+        // Infer code from message with improved matching
+        const msgLower = pikeDiag.message.toLowerCase();
+        if (msgLower.includes('uninitialized') || msgLower.includes('used before') || msgLower.includes('may be uninitialized')) {
             diagnostic.code = 'uninitialized-var';
-        } else if (pikeDiag.message.includes('syntax') || pikeDiag.message.includes('parse')) {
+        } else if (msgLower.includes('syntax') || msgLower.includes('parse') || msgLower.includes('unexpected token') || msgLower.includes('bracket mismatch')) {
             diagnostic.code = 'syntax-error';
-        } else if (pikeDiag.message.includes('type') || pikeDiag.message.includes('mismatch')) {
+        } else if (msgLower.includes('type') || msgLower.includes('mismatch') || msgLower.includes('illegal')) {
             diagnostic.code = 'type-mismatch';
+        } else if (msgLower.includes('unknown') || msgLower.includes('illegal')) {
+            diagnostic.code = 'unknown-symbol';
+        }
+    }
+
+    // Improve message display: add line:column if not already present
+    if (!pikeDiag.message.includes(`line ${pikeDiag.position.line}`) && pikeDiag.position.line > 0) {
+        const lineNum = pikeDiag.position.line;
+        const colNum = pikeDiag.position.column ?? 1;
+        // Prepend location info for errors
+        if (pikeDiag.severity === 'error') {
+            diagnostic.message = `[Line ${lineNum}:${colNum}] ${pikeDiag.message}`;
         }
     }
 
@@ -887,6 +901,8 @@ export function registerDiagnosticsHandlers(
                     symbols: hierarchicalSymbols,  // Use hierarchical symbols with children preserved
                     diagnostics,
                     symbolPositions: await buildSymbolPositionIndex(text, legacySymbols, tokenizeData),  // Use flat for indexing
+                    // PERF-005: Build symbol name index for O(1) hover lookups
+                    symbolNames: buildSymbolNameIndex(hierarchicalSymbols),
                     // INC-002: Store hashes for incremental change detection
                     contentHash,
                     lineHashes,
@@ -925,6 +941,8 @@ export function registerDiagnosticsHandlers(
                     symbols: symbolsWithDeprecated,  // Use symbols with deprecated extracted from source
                     diagnostics,
                     symbolPositions: await buildSymbolPositionIndex(text, symbolsWithDeprecated, tokenizeData),
+                    // PERF-005: Build symbol name index for O(1) hover lookups
+                    symbolNames: buildSymbolNameIndex(symbolsWithDeprecated),
                     // INC-002: Store hashes for incremental change detection
                     contentHash,
                     lineHashes,

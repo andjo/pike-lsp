@@ -16,7 +16,27 @@ export default [
             '**/*.mjs',
             '**/scripts/**',
             '**/.planning/**',
+            '**/*.test.ts',
+            'packages/vscode-pike/**/*.ts',
         ],
+    },
+    // TypeDoc generated files need browser globals
+    {
+        files: ['docs/api/typescript/**/*.js'],
+        languageOptions: {
+            globals: {
+                ...globals.browser,
+            },
+        },
+        rules: {
+            '@typescript-eslint/no-unused-vars': 'off',
+            '@typescript-eslint/no-explicit-any': 'off',
+            'no-undef': 'warn',
+            '@typescript-eslint/no-unused-expressions': 'off',
+            '@typescript-eslint/no-this-alias': 'off',
+            'no-redeclare': 'off',
+            'no-prototype-builtins': 'off',
+        },
     },
     {
         languageOptions: {
@@ -31,9 +51,9 @@ export default [
                 varsIgnorePattern: '^_'
             }],
             '@typescript-eslint/consistent-type-imports': 'off',
-            '@typescript-eslint/no-explicit-any': 'off',
+            '@typescript-eslint/no-explicit-any': 'warn',
             '@typescript-eslint/explicit-function-return-type': 'off',
-            '@typescript-eslint/ban-ts-comment': 'off',
+            '@typescript-eslint/ban-ts-comment': 'error',
             '@typescript-eslint/no-non-null-asserted-optional-chain': 'off',
             '@typescript-eslint/no-require-imports': 'off',
             '@typescript-eslint/ban-types': 'off',

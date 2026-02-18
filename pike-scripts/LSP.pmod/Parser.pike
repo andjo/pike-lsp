@@ -183,9 +183,55 @@ mapping parse_request(mapping params) {
                 decl = parser->parseDecl();
             };
 
-            if (parse_err) {
+            if (parse_err || !decl) {
                 autodoc_buffer = ({});
-                parser->readToken();
+
+                // Only generate diagnostic if there was an actual error (not just no decl)
+                if (parse_err) {
+                    string error_msg = describe_error(parse_err);
+                    // Get current position from parser
+                    int error_line = line;
+                    if (parser->current_line) {
+                        error_line = parser->current_line;
+                    }
+                    // Get current token for context
+                    string current_token = "";
+                    catch { current_token = parser->peekToken(); };
+                    // Add diagnostic for this error - improved message
+                    if (!has_value(error_msg, "expected identifier")) {
+                        // Improve error message with more context
+                        string improved_msg = improve_syntax_error_message(error_msg, current_token, filename, error_line);
+                        diagnostics += ({
+                            ([
+                                "message": improved_msg,
+                                "severity": "error",
+                                "position": ([
+                                    "file": filename,
+                                    "line": error_line
+                                ])
+                            ])
+                        });
+                    }
+                }
+                // Try to recover by skipping to next statement boundary
+                // Note: skipUntil may need multiple calls due to newline handling quirks
+                int recovery_attempts = 0;
+                while (recovery_attempts < 10) {
+                    parser->skipUntil((<";", "{", "}", "">));
+                    string tok = parser->peekToken();
+                    if (tok == "" || (tok != ";" && tok != "{" && tok != "}" && tok != "}")) {
+                        // EOF or not at statement boundary - try to skip one token
+                        parser->readToken();
+                        recovery_attempts++;
+                        if (parser->peekToken() == "") {
+                            break;  // EOF
+                        }
+                    } else {
+                        // At statement boundary - consume and continue
+                        parser->readToken();
+                        break;
+                    }
+                }
                 continue;
             }
 
@@ -355,6 +401,94 @@ mapping parse_request(mapping params) {
                 ])
             });
         }
+    }
+
+    // STEP 2b: If we found fewer symbols than expected, use tokenization fallback
+    // to find any remaining declarations that the parser missed
+    // This helps with error recovery - we can still provide partial results
+    array(mapping) tokenized_symbols = ({});
+    mixed tok_err = catch {
+        array(string) tokens = Parser.Pike.split(code);
+        array tok = Parser.Pike.tokenize(tokens);
+
+        // Track what's already found
+        multiset(string) found_names = (< >);
+        foreach(symbols, mapping s) {
+            if (s->name) found_names[s->name] = 1;
+        }
+
+        // Type keywords for detection
+        multiset(string) type_kw = (<
+            "int", "string", "float", "mixed", "void", "array",
+            "mapping", "multiset", "object", "program", "function"
+        >);
+
+        // Walk tokens looking for additional declarations
+        int i = 0;
+        while (i < sizeof(tok)) {
+            object t = tok[i];
+            string txt = t->text;
+
+            // Look for type keywords followed by identifiers
+            if (type_kw[txt]) {
+                // Check next token for identifier
+                int next_idx = i + 1;
+                while (next_idx < sizeof(tok)) {
+                    string next_txt = tok[next_idx]->text;
+                    // Skip whitespace and comments
+                    if (sizeof(next_txt) == 0 || next_txt[0] == ' ' || has_prefix(next_txt, "//")) {
+                        next_idx++;
+                        continue;
+                    }
+                    if (has_prefix(next_txt, "/*")) {
+                        // Skip to end of comment
+                        while (next_idx < sizeof(tok) && !has_prefix(tok[next_idx]->text, "*/")) {
+                            next_idx++;
+                        }
+                        next_idx += 2;
+                        continue;
+                    }
+                    break;
+                }
+
+                if (next_idx < sizeof(tok)) {
+                    string name = tok[next_idx]->text;
+                    // Skip if already found or not an identifier
+                    if (!found_names[name] && sizeof(name) > 0 &&
+                        !type_kw[name] && name[0] >= 'a' && name[0] <= 'z') {
+                        // Add as additional symbol
+                        tokenized_symbols += ({
+                            ([
+                                "name": name,
+                                "kind": "variable",
+                                "position": ([
+                                    "file": filename,
+                                    "line": t->line
+                                ])
+                            ])
+                        });
+                        found_names[name] = 1;
+                    }
+                }
+            }
+            i++;
+        }
+    };
+
+    // Add any tokenized symbols to results
+    if (sizeof(tokenized_symbols) > 0) {
+        symbols += tokenized_symbols;
+        // Add a diagnostic noting we used fallback extraction
+        diagnostics += ({
+            ([
+                "message": "Partial parsing - some symbols extracted via fallback",
+                "severity": "warning",
+                "position": ([
+                    "file": filename,
+                    "line": 1
+                ])
+            ])
+        });
     }
 
     // STEP 3: Extract symbols from preprocessor conditional branches
@@ -1203,6 +1337,70 @@ protected mapping symbol_to_json(object symbol, string|void documentation) {
     }
 
     return result;
+}
+
+//! Improve syntax error messages with more helpful context
+//! @param error_msg Raw error message from Pike parser
+//! @param current_token The token the parser is currently on
+//! @param filename Source filename
+//! @param error_line Line number where error occurred
+//! @returns Improved error message with context and suggestions
+protected string improve_syntax_error_message(string error_msg, string current_token, string filename, int error_line) {
+    string improved = "Syntax error";
+
+    // Extract key information from the raw error
+    string lower_msg = lower_case(error_msg);
+
+    // Handle common parsing errors with helpful messages
+    if (has_value(lower_msg, "unexpected")) {
+        // "Unexpected token" - explain what was found
+        if (sizeof(current_token) > 0) {
+            improved = sprintf("Unexpected token '%s' at line %d", current_token, error_line);
+            // Add suggestions based on what was found
+            if (current_token == "(") {
+                improved += ". Did you forget to close a parenthesis or bracket?";
+            } else if (current_token == ")") {
+                improved += ". There is an unmatched closing parenthesis.";
+            } else if (current_token == "}") {
+                improved += ". There is an unmatched closing brace.";
+            } else if (current_token == "{") {
+                improved += ". There is an unmatched opening brace.";
+            } else if (current_token == ";") {
+                improved += ". Unexpected semicolon - check for missing statements before this.";
+            } else if (has_prefix(current_token, "\"") || has_prefix(current_token, "'")) {
+                improved += ". Unclosed string or character literal.";
+            }
+        } else {
+            improved = sprintf("Unexpected end of input at line %d - missing closing bracket or semicolon?", error_line);
+        }
+    }
+    else if (has_value(lower_msg, "expected")) {
+        // "Expected X but found Y"
+        improved = sprintf("Syntax error at line %d: %s", error_line, error_msg);
+        // Add helpful suggestions
+        if (has_value(lower_msg, "identifier")) {
+            improved += ". Expected an identifier - check for typos or missing variable names.";
+        } else if (has_value(lower_msg, "(") || has_value(lower_msg, ")")) {
+            improved += ". Check for unmatched parentheses.";
+        } else if (has_value(lower_msg, ";")) {
+            improved += ". Statement may be missing a semicolon.";
+        }
+    }
+    else if (has_value(lower_msg, "unmatched") || has_value(lower_msg, "mismatch")) {
+        improved = sprintf("Bracket mismatch at line %d: %s", error_line, error_msg);
+    }
+    else if (has_value(lower_msg, "unknown")) {
+        improved = sprintf("Unknown syntax at line %d: %s. Check for typos in keywords.", error_line, error_msg);
+    }
+    else if (has_value(lower_msg, "illegal")) {
+        improved = sprintf("Illegal syntax at line %d: %s", error_line, error_msg);
+    }
+    else {
+        // Generic improvement for other errors
+        improved = sprintf("Syntax error at line %d: %s", error_line, error_msg);
+    }
+
+    return improved;
 }
 
 protected mapping|int type_to_json(object|void type) {

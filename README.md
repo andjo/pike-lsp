@@ -23,6 +23,7 @@
 - [Known Limitations](#known-limitations)
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
+- [API Reference](docs/api.md)
 
 ---
 
@@ -30,7 +31,7 @@ A comprehensive Language Server Protocol (LSP) implementation for the [Pike prog
 
 > **Note:** This project is in alpha. While functional for everyday use, some features may be incomplete or subject to change. This software is provided "as is" without warranty. See [LICENSE](LICENSE) for details.
 
-![Pike LSP Demo](images/demo.gif)
+![Pike LSP Demo](docs/images/demo.gif)
 
 ## Features
 
@@ -130,7 +131,7 @@ All 6 phases of Roxen framework support are complete:
 
 **Total:** 223 Roxen-specific tests passing
 
-See [ROXEN_SUPPORT_ROADMAP.md](ROXEN_SUPPORT_ROADMAP.md) for complete implementation details.
+See [ROXEN_SUPPORT_ROADMAP.md](docs/roxen-roadmap.md) for complete implementation details.
 
 ## Requirements
 
@@ -323,13 +324,21 @@ pnpm package
 
 While Pike LSP provides comprehensive IDE support, there are some known limitations:
 
-| Limitation | Description | Impact |
-|------------|-------------|--------|
-| **Preprocessor Directives** | Symbols inside `#if`/`#else`/`#endif` blocks are now indexed using token-based extraction. Conditional symbols appear with metadata (e.g., `[#if DEBUG]`). | **Improved**: Conditional symbols are now visible in outline, completion, and hover. Limitation: Syntactically incomplete branches use best-effort token extraction (may miss complex patterns). |
-| **Nested Classes** | Nested class declarations and their members are now recursively extracted up to depth 5. Document outline shows full hierarchy. | **Improved**: Go-to-definition, hover, and completion work for nested class members at all levels. Limitation: Very deep nesting (>5 levels) is capped for performance. |
-| **Type Inference** | Basic types from literals and signatures work. Flow-sensitive analysis and generic type resolution are not implemented. | Explicit types show correctly. Complex scenarios like `if (cond) x = 1; else x = "str"` show `mixed` instead of a narrowed type. |
-| **Dynamic Modules** | Runtime-loaded modules cannot be analyzed. | Completion won't show symbols from dynamically loaded code. |
-| **Deep Nesting** | Nested classes deeper than 5 levels are capped for performance. | Very deep nesting (>5 levels) may have limited symbol extraction. |
+### Analysis
+
+| Limitation | Status | Description | Technical Details |
+|------------|--------|-------------|-------------------|
+| **Preprocessor Directives** | ✅ Improved | Token-based extraction for symbols in `#if`/`#else`/`#endif` blocks. | Implemented in `Parser.pike:parse_preprocessor_blocks()`. Uses `Parser.Pike.tokenize()` to extract symbols from conditional branches. Symbols include metadata like `[#if DEBUG]`. May miss complex patterns in syntactically incomplete branches. |
+| **Nested Classes** | ✅ Supported | Recursive extraction up to depth 5. Full hierarchy in outline. | Implemented in `Parser.pike:get_symbols_recursive()` and `Introspection.pike:introspect_class_members()`. Go-to-definition, hover, and completion work at all levels. Depth is capped at 5 for performance. |
+| **Type Inference** | ⚠️ Partial | Basic types from literals and function signatures. | Uses `Introspection.pike:get_type_from_value()` for literal inference. Flow-sensitive analysis (tracking variable types across conditional branches) is not implemented. |
+| **Dynamic Modules** | ⚠️ Inherent | Runtime-loaded modules cannot be analyzed. | Uses `compile_string()` and `compile_file()` for static analysis. Patterns like `load_module(path)` or `compile_file(dynamic_path)` cannot be resolved statically. This is an inherent limitation of static analysis. |
+| **Deep Nesting** | ⚠️ Configurable | Classes deeper than 5 levels are capped for performance. | Default depth is 5, configurable via `maxDepth` parameter in `getWaterfallSymbols()`. Set to 0 for unlimited depth (may impact performance). |
+
+### Performance Considerations
+
+- **Large workspaces**: Initial indexing may take several seconds. Background indexing avoids blocking editing.
+- **Deep class hierarchies**: Exceeding 5 levels of nesting caps symbol extraction. Use `maxDepth` parameter to increase if needed.
+- **Complex preprocessor blocks**: Nested `#if` chains are parsed but may have reduced accuracy in syntactically invalid branches.
 
 ## Troubleshooting
 
@@ -368,3 +377,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 - [vscode-languageserver-node](https://github.com/microsoft/vscode-languageserver-node) - LSP framework
 - [Pike](https://pike.lysator.liu.se/) - The Pike programming language
 - [Tools.AutoDoc](https://pike.lysator.liu.se/generated/manual/modref/ex/predef_3A_3A/Tools/AutoDoc.html) - Pike's documentation parser
+# test

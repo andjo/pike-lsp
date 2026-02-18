@@ -87,6 +87,9 @@ pike-scripts/IMPORT_TRACKING_IMPLEMENTATION.md
 .planning/
 .agent/
 
+# Docusaurus build cache
+.docusaurus/
+
 # Agent config (local overrides)
 agent.config.local
 
@@ -98,3 +101,6 @@ t_v7.txt
 
 # Large binaries - install via package manager
 scripts/act
+.git/.worker-submit-marker
+.claude/.current_role
+patches/
