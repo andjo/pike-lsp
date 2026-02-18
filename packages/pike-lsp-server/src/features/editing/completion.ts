@@ -595,9 +595,10 @@ export function registerCompletionHandlers(
         }
 
         // --- Roxen completion integration ---
-        try {
-            // First check if cursor is inside an RXML string in Pike code
-            if (bridge) {
+        // Keep RXML extraction isolated so failures don't disable Roxen completions.
+        if (bridge) {
+            try {
+                // First check if cursor is inside an RXML string in Pike code
                 const rxmlStrings = await detectRXMLStrings(text, uri, bridge);
                 const inRXMLString = findRXMLStringAtPosition(params.position, rxmlStrings);
 
@@ -646,15 +647,21 @@ export function registerCompletionHandlers(
                         }
                     }
                 }
+            } catch (err) {
+                logger.debug('RXML completion failed', {
+                    error: err instanceof Error ? err.message : String(err)
+                });
             }
+        }
 
-            // Standard Roxen module completions
+        // Standard Roxen module completions (independent from RXML extraction).
+        try {
             const roxenCompletions = provideRoxenCompletions(lineText, params.position);
             if (roxenCompletions && roxenCompletions.length > 0) {
                 completions.push(...roxenCompletions);
             }
         } catch (err) {
-            logger.debug('Roxen/RXML completion failed', {
+            logger.debug('Roxen completion failed', {
                 error: err instanceof Error ? err.message : String(err)
             });
         }

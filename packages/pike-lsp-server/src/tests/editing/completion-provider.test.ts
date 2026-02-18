@@ -401,6 +401,20 @@ describe('Completion Provider', () => {
             const sizeofItem = findItem(result, 'sizeof');
             expect(sizeofItem?.kind).toBe(CompletionItemKind.Function);
         });
+
+        it('A.10: MODULE_ completion works even if RXML extraction is unavailable', async () => {
+            const code = 'constant module_type = MODULE_';
+            const { complete } = setup({
+                code,
+                symbols: [],
+            });
+
+            const result = await complete(0, code.length);
+            const names = labels(result);
+
+            expect(names).toContain('MODULE_LOCATION');
+            expect(names).toContain('MODULE_TAG');
+        });
     });
 
     // =========================================================================

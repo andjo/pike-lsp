@@ -381,6 +381,14 @@ export class BridgeManager {
     }
 
     /**
+     * Extract RXML strings from Pike code.
+     */
+    async roxenExtractRXMLStrings(code: string, filename?: string) {
+        if (!this.bridge) throw new Error('Bridge not available');
+        return this.bridge.roxenExtractRXMLStrings(code, filename);
+    }
+
+    /**
      * Register event handler on the underlying bridge.
      */
     on(event: string, handler: (...args: any[]) => void): void {
